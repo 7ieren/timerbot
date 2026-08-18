@@ -261,14 +261,19 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
         warn_at = respawns_at - timedelta(minutes=boss_cfg["warn_minutes"])
         now = datetime.now(timezone.utc)
 
+        unix_ts = int(respawns_at.timestamp())
+        role = guild.get_role(boss_cfg["role_id"]) if boss_cfg.get("role_id") else None
+        ping = role.mention if role else DEFAULT_PING
+
+        # The warning ping is kept around so the respawn can be announced by
+        # editing it in place, rather than posting a second message.
+        warn_msg = None
+
         warn_sleep = (warn_at - now).total_seconds()
         if warn_sleep > 0:
             await asyncio.sleep(warn_sleep)
-            role = guild.get_role(boss_cfg["role_id"]) if boss_cfg.get("role_id") else None
-            ping = role.mention if role else DEFAULT_PING
-            unix_ts = int(respawns_at.timestamp())
             if channel:
-                await channel.send(
+                warn_msg = await channel.send(
                     f"{ping} **{boss_name.title()}** respawns in "
                     f"**{boss_cfg['warn_minutes']}m** — <t:{unix_ts}:t>"
                 )
@@ -278,12 +283,19 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
         if final_sleep > 0:
             await asyncio.sleep(final_sleep)
 
-        if channel:
-            unix_ts = int(respawns_at.timestamp())
-            await channel.send(
-                f"**{boss_name.title()}** has respawned at <t:{unix_ts}:t> "
-                f"(<t:{unix_ts}:R>)"
-            )
+        respawned_text = (
+            f"{ping} **{boss_name.title()}** has respawned at <t:{unix_ts}:t> "
+            f"(<t:{unix_ts}:R>)"
+        )
+        if warn_msg is not None:
+            try:
+                await warn_msg.edit(content=respawned_text)
+            except discord.HTTPException:
+                pass
+        elif channel:
+            # No warning went out (timer started inside the warning window), so
+            # there's nothing to edit — announce the respawn directly.
+            await channel.send(respawned_text)
 
     except asyncio.CancelledError:
         return
