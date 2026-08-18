@@ -1,4 +1,4 @@
-# timerbot (draft)
+# timerbot
 
 Single-channel boss respawn timer bot. One message in one channel lists every
 active timer; it's empty (just the title) when nothing is running. Death
@@ -26,6 +26,7 @@ channel so you get a log of activity alongside the live list.
   - `minute:55` — died at :55 this hour
   - `time:14:30` / `time:23/05 14:30` — died at an exact UTC time (add `utc_offset` for local time)
 - `/cancel boss` — cancel a running timer
+- `/editboss` — edit a boss' respawn/warning times, roles to ping, and emoji
 
 ## How warnings work
 
