@@ -42,7 +42,7 @@ BOSS_PRESETS = {
     "barslaf": 48 * 60,
     "ukpana": 48 * 60,
     "soul-lich": 24 * 60 + 5,
-    "faith":    5 * 60 + 53,
+    "faith":    5 * 60 + 50,
     "billiard": 7 * 60 + 55,
     "actaemon": 6 * 60,
     "devilang": 5 * 60 + 33,
@@ -95,6 +95,9 @@ running_tasks: dict = {}
 # used to skip redundant edits.
 board_cache: dict = {}
 
+# In-memory only: guild_id -> asyncio.Lock serialising board updates.
+board_locks: dict = {}
+
 
 def guild_state(guild_id: int) -> dict:
     key = str(guild_id)
@@ -130,6 +133,19 @@ def format_remaining(respawns_at: datetime, now: datetime) -> str:
     return format_duration(math.ceil(remaining_seconds / 60))
 
 
+def boss_label(guild_id: int, boss_name: str) -> str:
+    """Display name for a boss — bold, prefixed with its emoji if one is set."""
+    cfg = guild_state(guild_id)["bosses"].get(boss_name, {})
+    emoji = cfg.get("emoji")
+    return f"{emoji} **{boss_name.title()}**" if emoji else f"**{boss_name.title()}**"
+
+
+def resolve_ping(guild: discord.Guild, boss_cfg: dict) -> str:
+    """Who to ping for this boss, resolved at send time so /editboss applies live."""
+    role = guild.get_role(boss_cfg["role_id"]) if boss_cfg.get("role_id") else None
+    return role.mention if role else DEFAULT_PING
+
+
 # ── Board message (single updating timer list) ───────────────────────────────
 
 def build_board_embed(guild_id: int) -> discord.Embed:
@@ -149,7 +165,7 @@ def build_board_embed(guild_id: int) -> discord.Embed:
         respawns_at = datetime.fromisoformat(info["respawns_at"])
         unix_ts = int(respawns_at.timestamp())
         rows.append(
-            f"**{boss_name.title()}** — **{format_remaining(respawns_at, now)}** "
+            f"{boss_label(guild_id, boss_name)} — **{format_remaining(respawns_at, now)}** "
             f"(<t:{unix_ts}:t>)"
         )
 
@@ -171,52 +187,66 @@ async def get_board_channel(guild: discord.Guild) -> discord.TextChannel | None:
     return channel
 
 
+def board_lock(guild_id: int) -> asyncio.Lock:
+    lock = board_locks.get(guild_id)
+    if lock is None:
+        lock = board_locks[guild_id] = asyncio.Lock()
+    return lock
+
+
 async def refresh_board(guild: discord.Guild, repost: bool = False) -> None:
     """Update the board in place, or with repost=True move it to the channel bottom."""
-    state = guild_state(guild.id)
-    channel = await get_board_channel(guild)
-    if not channel:
-        return
-
-    embed = build_board_embed(guild.id)
-    rendered = embed.description or ""
-
-    # The countdown is minute-granular, so most ticks render identically to the
-    # last one. Skip those instead of spending an API call to change nothing.
-    if not repost and state["board_message_id"] and board_cache.get(guild.id) == rendered:
-        return
-
-    if repost and state["board_message_id"]:
-        # Delete the old board first — two boards in one channel means the
-        # stale one keeps showing countdowns nothing is refreshing.
-        try:
-            old = await channel.fetch_message(state["board_message_id"])
-            await old.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
-        state["board_message_id"] = None
-
-    msg = None
-    if state["board_message_id"]:
-        try:
-            msg = await channel.fetch_message(state["board_message_id"])
-        except (discord.NotFound, discord.HTTPException):
-            msg = None
-
-    if msg is None:
-        msg = await channel.send(embed=embed)
-        state["board_message_id"] = msg.id
-        save_data(store)
-    else:
-        try:
-            await msg.edit(embed=embed)
-        except discord.HTTPException:
-            # Forget the cached render so the next tick retries rather than
-            # assuming the board is up to date.
-            board_cache.pop(guild.id, None)
+    # Serialised per guild: the refresher loop, /died's repost, a finishing
+    # timer and /setboard all call this, and a repost leaves board_message_id
+    # None across an API round trip. A second caller entering that window sees
+    # "no board yet" and posts its own, leaving an orphaned second timer list
+    # that nothing ever updates again.
+    async with board_lock(guild.id):
+        state = guild_state(guild.id)
+        channel = await get_board_channel(guild)
+        if not channel:
             return
 
-    board_cache[guild.id] = rendered
+        embed = build_board_embed(guild.id)
+        rendered = embed.description or ""
+
+        # The countdown is minute-granular, so most ticks render identically to
+        # the last one. Skip those instead of spending an API call to change
+        # nothing. (Also collapses callers that queued behind a repost.)
+        if not repost and state["board_message_id"] and board_cache.get(guild.id) == rendered:
+            return
+
+        if repost and state["board_message_id"]:
+            # Delete the old board first — two boards in one channel means the
+            # stale one keeps showing countdowns nothing is refreshing.
+            try:
+                old = await channel.fetch_message(state["board_message_id"])
+                await old.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            state["board_message_id"] = None
+
+        msg = None
+        if state["board_message_id"]:
+            try:
+                msg = await channel.fetch_message(state["board_message_id"])
+            except (discord.NotFound, discord.HTTPException):
+                msg = None
+
+        if msg is None:
+            msg = await channel.send(embed=embed)
+            state["board_message_id"] = msg.id
+            save_data(store)
+        else:
+            try:
+                await msg.edit(embed=embed)
+            except discord.HTTPException:
+                # Forget the cached render so the next tick retries rather than
+                # assuming the board is up to date.
+                board_cache.pop(guild.id, None)
+                return
+
+        board_cache[guild.id] = rendered
 
 
 # ── Timer logic ───────────────────────────────────────────────────────────────
@@ -235,10 +265,19 @@ def resolve_died_at(now: datetime, died_at_minute: int | None, died_at_dt: datet
 async def start_timer(guild: discord.Guild, boss_name: str, respawns_at: datetime, reported_by: str, repost: bool = False) -> None:
     state = guild_state(guild.id)
 
-    # Cancel any existing run for this boss
+    # Cancel any existing run for this boss, and wait for it to finish unwinding
+    # before touching state. cancel() only schedules the cancellation, so the old
+    # task's finally block would otherwise run *after* the write below and delete
+    # the timer entry we just created — leaving the new timer invisible on the
+    # board and its task dead on a KeyError.
     task_map = running_tasks.setdefault(guild.id, {})
-    if boss_name in task_map:
-        task_map[boss_name].cancel()
+    old_task = task_map.pop(boss_name, None)
+    if old_task is not None:
+        old_task.cancel()
+        try:
+            await old_task
+        except asyncio.CancelledError:
+            pass
 
     state["timers"][boss_name] = {
         "respawns_at": respawns_at.isoformat(),
@@ -262,8 +301,6 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
         now = datetime.now(timezone.utc)
 
         unix_ts = int(respawns_at.timestamp())
-        role = guild.get_role(boss_cfg["role_id"]) if boss_cfg.get("role_id") else None
-        ping = role.mention if role else DEFAULT_PING
 
         # The warning ping is kept around so the respawn can be announced by
         # editing it in place, rather than posting a second message.
@@ -274,8 +311,8 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
             await asyncio.sleep(warn_sleep)
             if channel:
                 warn_msg = await channel.send(
-                    f"{ping} **{boss_name.title()}** respawns in "
-                    f"**{boss_cfg['warn_minutes']}m** — <t:{unix_ts}:t>"
+                    f"{resolve_ping(guild, boss_cfg)} {boss_label(guild.id, boss_name)} "
+                    f"respawns in **{boss_cfg['warn_minutes']}m** — <t:{unix_ts}:t>"
                 )
 
         now = datetime.now(timezone.utc)
@@ -284,8 +321,8 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
             await asyncio.sleep(final_sleep)
 
         respawned_text = (
-            f"{ping} **{boss_name.title()}** has respawned at <t:{unix_ts}:t> "
-            f"(<t:{unix_ts}:R>)"
+            f"{resolve_ping(guild, boss_cfg)} {boss_label(guild.id, boss_name)} "
+            f"has respawned at <t:{unix_ts}:t> (<t:{unix_ts}:R>)"
         )
         if warn_msg is not None:
             try:
@@ -372,6 +409,7 @@ async def addboss(
         "respawn_minutes": total_minutes,
         "warn_minutes": warn_minutes if warn_minutes is not None else default_warn_minutes(total_minutes),
         "role_id": role.id if role else None,
+        "emoji": None,
     }
     save_data(store)
 
@@ -379,9 +417,125 @@ async def addboss(
         f"✅ **{boss_name.title()}** registered.\n"
         f"• Respawn: **{format_duration(total_minutes)}**\n"
         f"• Warning ping: **{state['bosses'][boss_name]['warn_minutes']}m** before respawn\n"
-        f"• Ping role: {role.mention if role else f'*(none — {DEFAULT_PING})*'}",
+        f"• Ping role: {role.mention if role else f'*(none — {DEFAULT_PING})*'}\n"
+        f"• Emoji: *(none — set one with `/editboss`)*",
         ephemeral=True,
     )
+
+
+# Words that mean "take the emoji off this boss" — slash command options can't
+# express "set this back to empty" any other way.
+EMOJI_CLEAR_WORDS = {"none", "no", "off", "-", "clear", "remove", "null"}
+
+
+@bot.tree.command(name="editboss", description="Edit a boss's respawn time, ping role, warning time, or emoji.")
+@app_commands.describe(
+    boss="Boss to edit",
+    days="New respawn days", hours="New respawn hours",
+    minutes="New respawn minutes", seconds="New respawn seconds",
+    role="New role to ping on the warning",
+    emoji="Emoji shown next to this boss — pass `none` to remove it",
+    warn_minutes="New warning time, in minutes before respawn",
+    clear_role="Remove the ping role (falls back to @everyone)",
+)
+@app_commands.autocomplete(boss=boss_autocomplete)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def editboss(
+    interaction: discord.Interaction,
+    boss: str,
+    days: int = None,
+    hours: int = None,
+    minutes: int = None,
+    seconds: int = None,
+    role: discord.Role = None,
+    emoji: str = None,
+    warn_minutes: int = None,
+    clear_role: bool = False,
+):
+    state = guild_state(interaction.guild_id)
+    boss = boss.lower().strip()
+    # Mutated in place rather than replaced, so a timer already counting down
+    # picks up the new role and emoji when it fires.
+    cfg = state["bosses"].get(boss)
+
+    if cfg is None:
+        await interaction.response.send_message(
+            f"**{boss}** is not registered. Use `/addboss` first.", ephemeral=True
+        )
+        return
+    if role is not None and clear_role:
+        await interaction.response.send_message(
+            "Pick either `role` or `clear_role`, not both.", ephemeral=True
+        )
+        return
+
+    changes = []
+    timing_changed = False
+
+    if any(v is not None for v in (days, hours, minutes, seconds)):
+        total_minutes = (days or 0) * 1440 + (hours or 0) * 60 + (minutes or 0) + (seconds or 0) / 60
+        if total_minutes <= 0:
+            await interaction.response.send_message(
+                "Respawn time must be greater than zero.", ephemeral=True
+            )
+            return
+        cfg["respawn_minutes"] = total_minutes
+        changes.append(f"• Respawn: **{format_duration(total_minutes)}**")
+        timing_changed = True
+
+    if warn_minutes is not None:
+        if warn_minutes <= 0:
+            await interaction.response.send_message(
+                "Warning time must be at least 1 minute.", ephemeral=True
+            )
+            return
+        cfg["warn_minutes"] = warn_minutes
+        changes.append(f"• Warning ping: **{warn_minutes}m** before respawn")
+        timing_changed = True
+
+    if clear_role:
+        cfg["role_id"] = None
+        changes.append(f"• Ping role: *(none — {DEFAULT_PING})*")
+    elif role is not None:
+        cfg["role_id"] = role.id
+        changes.append(f"• Ping role: {role.mention}")
+
+    if emoji is not None:
+        new_emoji = emoji.strip()
+        if new_emoji.lower() in EMOJI_CLEAR_WORDS:
+            new_emoji = None
+        elif len(new_emoji) > 64 or "\n" in new_emoji:
+            await interaction.response.send_message(
+                "That doesn't look like an emoji — pass a single emoji, or `none` to remove it.",
+                ephemeral=True,
+            )
+            return
+        cfg["emoji"] = new_emoji
+        changes.append(f"• Emoji: {new_emoji}" if new_emoji else "• Emoji: *(removed)*")
+
+    if not changes:
+        await interaction.response.send_message(
+            "Nothing to change — pass at least one of respawn time, `role`, `emoji`, "
+            "`warn_minutes`, or `clear_role`.",
+            ephemeral=True,
+        )
+        return
+
+    save_data(store)
+
+    # A running timer's respawn moment was fixed when the death was reported, so
+    # a new respawn/warning length only takes effect from the next report.
+    note = ""
+    if timing_changed and boss in state["timers"]:
+        note = (
+            f"\n*{boss.title()} has a timer running — the new timing applies "
+            f"from its next `/died` report.*"
+        )
+
+    await interaction.response.send_message(
+        f"✅ **{boss.title()}** updated.\n" + "\n".join(changes) + note, ephemeral=True
+    )
+    await refresh_board(interaction.guild)
 
 
 @bot.tree.command(name="removeboss", description="Unregister a boss.")
@@ -409,7 +563,7 @@ async def bosses_cmd(interaction: discord.Interaction):
     # keep a stable order between calls.
     ordered = sorted(state["bosses"].items(), key=lambda kv: (kv[1]["respawn_minutes"], kv[0]))
     lines = [
-        f"• **{name.title()}** — {format_duration(cfg['respawn_minutes'])} respawn, "
+        f"• {boss_label(interaction.guild_id, name)} — {format_duration(cfg['respawn_minutes'])} respawn, "
         f"{cfg['warn_minutes']}m warning"
         for name, cfg in ordered
     ]
@@ -490,7 +644,8 @@ async def report_death(
     channel = await get_board_channel(interaction.guild)
     if channel:
         await channel.send(
-            f"\U0001f480 **{boss.title()}** reported dead {died_note} by {interaction.user.mention}."
+            f"\U0001f480 {boss_label(interaction.guild_id, boss)} reported dead {died_note} "
+            f"by {interaction.user.mention}."
         )
 
     # Repost last so the refreshed timer list is the newest message in the channel.
@@ -557,6 +712,7 @@ async def seedpresets(interaction: discord.Interaction):
                 "respawn_minutes": respawn_minutes,
                 "warn_minutes": default_warn_minutes(respawn_minutes),
                 "role_id": None,
+                "emoji": None,
             }
             added.append(name.title())
     save_data(store)
@@ -587,6 +743,7 @@ async def help_cmd(interaction: discord.Interaction):
         value=(
             "`/setboard` — pick the channel for the timer list and pings\n"
             "`/addboss` — register a boss\n"
+            "`/editboss` — change a boss's respawn time, ping role, or emoji\n"
             "`/removeboss` — unregister a boss\n"
             "`/seedpresets` — register the built-in preset bosses"
         ),
@@ -649,12 +806,17 @@ async def on_ready():
                 if channel:
                     unix_ts = int(respawns_at.timestamp())
                     await channel.send(
-                        f"**{boss_name.title()}** respawned at <t:{unix_ts}:t> "
+                        f"{boss_label(guild.id, boss_name)} respawned at <t:{unix_ts}:t> "
                         f"(<t:{unix_ts}:R>) while the bot was offline."
                     )
             else:
                 task_map = running_tasks.setdefault(guild.id, {})
-                task_map[boss_name] = asyncio.create_task(_run_timer(guild, boss_name))
+                # on_ready fires again on every gateway re-IDENTIFY. Without this
+                # guard each reconnect starts a second task per boss, and the
+                # warning ping fires once per copy.
+                existing = task_map.get(boss_name)
+                if existing is None or existing.done():
+                    task_map[boss_name] = asyncio.create_task(_run_timer(guild, boss_name))
         save_data(store)
         await refresh_board(guild)
 
