@@ -564,10 +564,29 @@ async def bosses_cmd(interaction: discord.Interaction):
     ordered = sorted(state["bosses"].items(), key=lambda kv: (kv[1]["respawn_minutes"], kv[0]))
     lines = [
         f"• {boss_label(interaction.guild_id, name)} — {format_duration(cfg['respawn_minutes'])} respawn, "
-        f"{cfg['warn_minutes']}m warning"
+        f"{cfg['warn_minutes']}m warning, pings {resolve_ping(interaction.guild, cfg)}"
         for name, cfg in ordered
     ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    # Sent as an embed: role mentions render as the role name but never notify
+    # anyone from inside an embed, and the 4096-char description leaves room for
+    # a roster whose <@&id> mentions would outgrow the 2000-char message limit.
+    description = "\n".join(lines)
+    if len(description) > 4000:
+        kept, used = [], 0
+        for line in lines:
+            if used + len(line) + 1 > 3900:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        description = "\n".join(kept) + f"\n*…and {len(lines) - len(kept)} more.*"
+
+    embed = discord.Embed(
+        title="Registered Bosses",
+        description=description,
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # Slash commands have no alias mechanism — /died and /d are two registered
