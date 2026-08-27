@@ -6,6 +6,7 @@ import json
 import math
 import os
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,6 +32,11 @@ BOARD_REFRESH_SECONDS = 10
 # Optional starter presets so you don't have to /addboss everything by hand.
 # Feel free to edit/delete these — they're just a convenience seed.
 # Values are minutes, and may be fractional: write `29 + 52 / 60` for 29m52s.
+#
+# One roster per board: BOSS_PRESETS feeds the main board (`/setboard`),
+# MINI_BOSS_PRESETS feeds the mini board (`/setminiboard`). Membership here is
+# only the default — a boss's board is stored per guild and can be changed
+# any time with `/editboss board:`.
 BOSS_PRESETS = {
     "platanista": 168 * 60,
     "caligo": 168 * 60,
@@ -45,13 +51,24 @@ BOSS_PRESETS = {
     "faith":    5 * 60 + 53,
     "billiard": 7 * 60 + 55,
     "actaemon": 6 * 60,
+}
+
+MINI_BOSS_PRESETS = {
     "devilang": 5 * 60 + 33,
     "wadangka": 2 * 60 + 30,
     "awakenkooii": 1 * 60 + 3,
     "glucose":  30,
-    "overload": 29 + 52 / 60,
+    "overload": 30,
     "apapa":    15,
 }
+
+# The two boards. Each lives in its own channel and shows only the timers for
+# bosses assigned to it; warnings and respawn pings go to that same channel.
+BOARDS = ("main", "mini")
+BOARD_TITLES = {"main": "JR's Boss Timers", "mini": "JR's Mini Boss Timers"}
+BOARD_NOUNS = {"main": "main boss", "mini": "mini boss"}
+BOARD_SETTERS = {"main": "/setboard", "mini": "/setminiboard"}
+PRESETS_BY_BOARD = {"main": BOSS_PRESETS, "mini": MINI_BOSS_PRESETS}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -63,16 +80,21 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Schema:
 # {
 #   "<guild_id>": {
-#     "board_channel_id": 123,
-#     "board_message_id": 456,
+#     "boards": {
+#       "main": {"channel_id": 123, "message_id": 456},
+#       "mini": {"channel_id": 789, "message_id": 111}
+#     },
 #     "bosses": {
-#       "faith": {"respawn_minutes": 353, "warn_minutes": 5, "role_id": null}
+#       "faith": {"respawn_minutes": 353, "warn_minutes": 5, "role_id": null,
+#                 "emoji": null, "category": "main"}
 #     },
 #     "timers": {
 #       "faith": {"respawns_at": "2026-08-16T05:53:00+00:00", "reported_by": "someone"}
 #     }
 #   }
 # }
+# Timers stay in one flat dict; each board renders the subset whose boss carries
+# its category. guild_state() migrates the old single-board keys on load.
 
 def load_data() -> dict:
     if os.path.exists(DATA_FILE):
@@ -91,21 +113,57 @@ store: dict = load_data()
 # In-memory only: guild_id -> {boss_name: asyncio.Task}
 running_tasks: dict = {}
 
-# In-memory only: guild_id -> last board text actually pushed to Discord,
-# used to skip redundant edits.
+# In-memory only: (guild_id, category) -> last board text actually pushed to
+# Discord, used to skip redundant edits.
 board_cache: dict = {}
 
-# In-memory only: guild_id -> asyncio.Lock serialising board updates.
+# In-memory only: (guild_id, category) -> asyncio.Lock serialising that board.
 board_locks: dict = {}
+
+
+def default_category(boss_name: str) -> str:
+    """Which board a boss belongs to when nothing has been stored for it yet."""
+    return "mini" if boss_name in MINI_BOSS_PRESETS else "main"
 
 
 def guild_state(guild_id: int) -> dict:
     key = str(guild_id)
     if key not in store:
-        store[key] = {"board_channel_id": None, "board_message_id": None, "bosses": {}, "timers": {}}
-    store[key].setdefault("bosses", {})
-    store[key].setdefault("timers", {})
-    return store[key]
+        store[key] = {"boards": {}, "bosses": {}, "timers": {}}
+    state = store[key]
+    state.setdefault("bosses", {})
+    state.setdefault("timers", {})
+    boards = state.setdefault("boards", {})
+    for category in BOARDS:
+        boards.setdefault(category, {"channel_id": None, "message_id": None})
+
+    # Migrate the old single-board schema. The existing board becomes the main
+    # one and keeps its message id, so it is edited in place rather than
+    # reposted — otherwise the channel ends up with two lists.
+    if "board_channel_id" in state or "board_message_id" in state:
+        if state.get("board_channel_id") and not boards["main"]["channel_id"]:
+            boards["main"]["channel_id"] = state["board_channel_id"]
+            boards["main"]["message_id"] = state.get("board_message_id")
+        state.pop("board_channel_id", None)
+        state.pop("board_message_id", None)
+
+    # Bosses registered before boards existed are classified by the preset
+    # rosters, so an existing install splits itself as soon as a mini board is
+    # set. Anything in neither roster stays on the main board.
+    for name, cfg in state["bosses"].items():
+        cfg.setdefault("category", default_category(name))
+
+    return state
+
+
+def board_state(guild_id: int, category: str) -> dict:
+    return guild_state(guild_id)["boards"][category]
+
+
+def boss_category(guild_id: int, boss_name: str) -> str:
+    cfg = guild_state(guild_id)["bosses"].get(boss_name)
+    category = cfg.get("category") if cfg else None
+    return category if category in BOARDS else default_category(boss_name)
 
 
 def default_warn_minutes(respawn_minutes: int) -> int:
@@ -146,15 +204,18 @@ def resolve_ping(guild: discord.Guild, boss_cfg: dict) -> str:
     return role.mention if role else DEFAULT_PING
 
 
-# ── Board message (single updating timer list) ───────────────────────────────
+# ── Board messages (one updating timer list per board) ───────────────────────
 
-def build_board_embed(guild_id: int) -> discord.Embed:
-    state = guild_state(guild_id)
-    timers = state["timers"]
+def build_board_embed(guild_id: int, category: str) -> discord.Embed:
+    timers = {
+        name: info
+        for name, info in guild_state(guild_id)["timers"].items()
+        if boss_category(guild_id, name) == category
+    }
 
     if not timers:
         return discord.Embed(
-            title="JR's Boss Timers",
+            title=BOARD_TITLES[category],
             description="No active timers :(",
             color=discord.Color.dark_grey(),
         )
@@ -170,7 +231,7 @@ def build_board_embed(guild_id: int) -> discord.Embed:
         )
 
     embed = discord.Embed(
-        title="JR's Boss Timers",
+        title=BOARD_TITLES[category],
         description="\n".join(rows),
         color=discord.Color.blurple(),
     )
@@ -179,63 +240,64 @@ def build_board_embed(guild_id: int) -> discord.Embed:
     return embed
 
 
-async def get_board_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    state = guild_state(guild.id)
-    if not state["board_channel_id"]:
+async def get_board_channel(guild: discord.Guild, category: str) -> discord.TextChannel | None:
+    channel_id = board_state(guild.id, category)["channel_id"]
+    if not channel_id:
         return None
-    channel = guild.get_channel(state["board_channel_id"])
-    return channel
+    return guild.get_channel(channel_id)
 
 
-def board_lock(guild_id: int) -> asyncio.Lock:
-    lock = board_locks.get(guild_id)
+def board_lock(guild_id: int, category: str) -> asyncio.Lock:
+    key = (guild_id, category)
+    lock = board_locks.get(key)
     if lock is None:
-        lock = board_locks[guild_id] = asyncio.Lock()
+        lock = board_locks[key] = asyncio.Lock()
     return lock
 
 
-async def refresh_board(guild: discord.Guild, repost: bool = False) -> None:
-    """Update the board in place, or with repost=True move it to the channel bottom."""
-    # Serialised per guild: the refresher loop, /died's repost, a finishing
-    # timer and /setboard all call this, and a repost leaves board_message_id
-    # None across an API round trip. A second caller entering that window sees
-    # "no board yet" and posts its own, leaving an orphaned second timer list
-    # that nothing ever updates again.
-    async with board_lock(guild.id):
-        state = guild_state(guild.id)
-        channel = await get_board_channel(guild)
+async def refresh_board(guild: discord.Guild, category: str, repost: bool = False) -> None:
+    """Update one board in place, or with repost=True move it to the channel bottom."""
+    # Serialised per board: the refresher loop, /d's repost, a finishing timer
+    # and /setboard all call this, and a repost leaves message_id None across an
+    # API round trip. A second caller entering that window sees "no board yet"
+    # and posts its own, leaving an orphaned list that nothing ever updates.
+    # Keyed per (guild, board) so the two boards never block each other.
+    async with board_lock(guild.id, category):
+        board = board_state(guild.id, category)
+        channel = await get_board_channel(guild, category)
         if not channel:
             return
 
-        embed = build_board_embed(guild.id)
+        embed = build_board_embed(guild.id, category)
         rendered = embed.description or ""
+        cache_key = (guild.id, category)
 
         # The countdown is minute-granular, so most ticks render identically to
         # the last one. Skip those instead of spending an API call to change
         # nothing. (Also collapses callers that queued behind a repost.)
-        if not repost and state["board_message_id"] and board_cache.get(guild.id) == rendered:
+        if not repost and board["message_id"] and board_cache.get(cache_key) == rendered:
             return
 
-        if repost and state["board_message_id"]:
+        if repost and board["message_id"]:
             # Delete the old board first — two boards in one channel means the
             # stale one keeps showing countdowns nothing is refreshing.
             try:
-                old = await channel.fetch_message(state["board_message_id"])
+                old = await channel.fetch_message(board["message_id"])
                 await old.delete()
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
-            state["board_message_id"] = None
+            board["message_id"] = None
 
         msg = None
-        if state["board_message_id"]:
+        if board["message_id"]:
             try:
-                msg = await channel.fetch_message(state["board_message_id"])
+                msg = await channel.fetch_message(board["message_id"])
             except (discord.NotFound, discord.HTTPException):
                 msg = None
 
         if msg is None:
             msg = await channel.send(embed=embed)
-            state["board_message_id"] = msg.id
+            board["message_id"] = msg.id
             save_data(store)
         else:
             try:
@@ -243,10 +305,15 @@ async def refresh_board(guild: discord.Guild, repost: bool = False) -> None:
             except discord.HTTPException:
                 # Forget the cached render so the next tick retries rather than
                 # assuming the board is up to date.
-                board_cache.pop(guild.id, None)
+                board_cache.pop(cache_key, None)
                 return
 
-        board_cache[guild.id] = rendered
+        board_cache[cache_key] = rendered
+
+
+async def refresh_boss_board(guild: discord.Guild, boss_name: str, repost: bool = False) -> None:
+    """Refresh only the board the given boss lives on."""
+    await refresh_board(guild, boss_category(guild.id, boss_name), repost=repost)
 
 
 # ── Timer logic ───────────────────────────────────────────────────────────────
@@ -284,14 +351,13 @@ async def start_timer(guild: discord.Guild, boss_name: str, respawns_at: datetim
         "reported_by": reported_by,
     }
     save_data(store)
-    await refresh_board(guild, repost=repost)
+    await refresh_boss_board(guild, boss_name, repost=repost)
 
     task_map[boss_name] = asyncio.create_task(_run_timer(guild, boss_name))
 
 
 async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
     state = guild_state(guild.id)
-    channel = await get_board_channel(guild)
 
     try:
         timer_info = state["timers"][boss_name]
@@ -309,6 +375,9 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
         warn_sleep = (warn_at - now).total_seconds()
         if warn_sleep > 0:
             await asyncio.sleep(warn_sleep)
+            # Resolved here rather than at task start, so a boss moved between
+            # boards mid-countdown alerts in its new channel.
+            channel = await get_board_channel(guild, boss_category(guild.id, boss_name))
             if channel:
                 warn_msg = await channel.send(
                     f"{resolve_ping(guild, boss_cfg)} {boss_label(guild.id, boss_name)} "
@@ -329,10 +398,12 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
                 await warn_msg.edit(content=respawned_text)
             except discord.HTTPException:
                 pass
-        elif channel:
+        else:
             # No warning went out (timer started inside the warning window), so
             # there's nothing to edit — announce the respawn directly.
-            await channel.send(respawned_text)
+            channel = await get_board_channel(guild, boss_category(guild.id, boss_name))
+            if channel:
+                await channel.send(respawned_text)
 
     except asyncio.CancelledError:
         return
@@ -341,7 +412,7 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
         save_data(store)
         task_map = running_tasks.get(guild.id, {})
         task_map.pop(boss_name, None)
-        await refresh_board(guild)
+        await refresh_boss_board(guild, boss_name)
 
 
 # ── Boss / timer autocomplete ─────────────────────────────────────────────────
@@ -366,16 +437,56 @@ async def active_timer_autocomplete(interaction: discord.Interaction, current: s
 
 # ── Commands ───────────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="setboard", description="Set the channel where the timer list and notifications are posted.")
-@app_commands.describe(channel="The channel to use as the timer board")
+async def set_board(interaction: discord.Interaction, category: str, channel: discord.TextChannel) -> None:
+    """Shared by /setboard and /setminiboard."""
+    other = "mini" if category == "main" else "main"
+    if board_state(interaction.guild_id, other)["channel_id"] == channel.id:
+        # Both boards in one channel would interleave two lists that each repost
+        # to the bottom, so neither would stay visible.
+        await interaction.response.send_message(
+            f"{channel.mention} is already the {BOARD_NOUNS[other]} board — "
+            f"pick a different channel.",
+            ephemeral=True,
+        )
+        return
+
+    board = board_state(interaction.guild_id, category)
+    board["channel_id"] = channel.id
+    board["message_id"] = None
+    board_cache.pop((interaction.guild_id, category), None)
+    save_data(store)
+
+    roster = sorted(
+        name for name in guild_state(interaction.guild_id)["bosses"]
+        if boss_category(interaction.guild_id, name) == category
+    )
+    if not roster:
+        detail = " — assign some with `/editboss board:` or `/seedpresets`"
+    else:
+        shown = ", ".join(n.title() for n in roster[:20])
+        rest = len(roster) - 20
+        detail = f": {shown}" + (f", and {rest} more" if rest > 0 else "")
+
+    await interaction.response.send_message(
+        f"✅ {BOARD_NOUNS[category].title()} board set to {channel.mention}.\n"
+        f"It tracks **{len(roster)}** boss{'es' if len(roster) != 1 else ''}{detail}",
+        ephemeral=True,
+    )
+    await refresh_board(interaction.guild, category)
+
+
+@bot.tree.command(name="setboard", description="Set the channel for the main boss timer list and pings.")
+@app_commands.describe(channel="The channel to use as the main boss timer board")
 @app_commands.checks.has_permissions(manage_channels=True)
 async def setboard(interaction: discord.Interaction, channel: discord.TextChannel):
-    state = guild_state(interaction.guild_id)
-    state["board_channel_id"] = channel.id
-    state["board_message_id"] = None
-    save_data(store)
-    await interaction.response.send_message(f"✅ Timer board set to {channel.mention}.", ephemeral=True)
-    await refresh_board(interaction.guild)
+    await set_board(interaction, "main", channel)
+
+
+@bot.tree.command(name="setminiboard", description="Set the channel for the mini boss timer list and pings.")
+@app_commands.describe(channel="The channel to use as the mini boss timer board")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def setminiboard(interaction: discord.Interaction, channel: discord.TextChannel):
+    await set_board(interaction, "mini", channel)
 
 
 @bot.tree.command(name="addboss", description="Register a boss and its respawn time.")
@@ -384,6 +495,7 @@ async def setboard(interaction: discord.Interaction, channel: discord.TextChanne
     days="Respawn days", hours="Respawn hours", minutes="Respawn minutes", seconds="Respawn seconds",
     role="Role to ping on the warning (optional)",
     warn_minutes="Override the auto warning time (optional — default is 1 or 5 min based on respawn length)",
+    board="Which board this boss belongs to (default: main)",
 )
 @app_commands.checks.has_permissions(manage_channels=True)
 async def addboss(
@@ -395,6 +507,7 @@ async def addboss(
     seconds: int = 0,
     role: discord.Role = None,
     warn_minutes: int = None,
+    board: Literal["main", "mini"] = "main",
 ):
     total_minutes = days * 1440 + hours * 60 + minutes + seconds / 60
     if total_minutes <= 0:
@@ -410,6 +523,7 @@ async def addboss(
         "warn_minutes": warn_minutes if warn_minutes is not None else default_warn_minutes(total_minutes),
         "role_id": role.id if role else None,
         "emoji": None,
+        "category": board,
     }
     save_data(store)
 
@@ -418,6 +532,7 @@ async def addboss(
         f"• Respawn: **{format_duration(total_minutes)}**\n"
         f"• Warning ping: **{state['bosses'][boss_name]['warn_minutes']}m** before respawn\n"
         f"• Ping role: {role.mention if role else f'*(none — {DEFAULT_PING})*'}\n"
+        f"• Board: **{BOARD_NOUNS[board].title()}** ({BOARD_SETTERS[board]})\n"
         f"• Emoji: *(none — set one with `/editboss`)*",
         ephemeral=True,
     )
@@ -437,6 +552,7 @@ EMOJI_CLEAR_WORDS = {"none", "no", "off", "-", "clear", "remove", "null"}
     emoji="Emoji shown next to this boss — pass `none` to remove it",
     warn_minutes="New warning time, in minutes before respawn",
     clear_role="Remove the ping role (falls back to @everyone)",
+    board="Move this boss to the main or mini board",
 )
 @app_commands.autocomplete(boss=boss_autocomplete)
 @app_commands.checks.has_permissions(manage_channels=True)
@@ -451,6 +567,7 @@ async def editboss(
     emoji: str = None,
     warn_minutes: int = None,
     clear_role: bool = False,
+    board: Literal["main", "mini"] = None,
 ):
     state = guild_state(interaction.guild_id)
     boss = boss.lower().strip()
@@ -471,6 +588,15 @@ async def editboss(
 
     changes = []
     timing_changed = False
+    moved_from = None
+
+    if board is not None and board != boss_category(interaction.guild_id, boss):
+        moved_from = boss_category(interaction.guild_id, boss)
+        cfg["category"] = board
+        changes.append(
+            f"• Board: **{BOARD_NOUNS[board].title()}** "
+            f"(was {BOARD_NOUNS[moved_from]})"
+        )
 
     if any(v is not None for v in (days, hours, minutes, seconds)):
         total_minutes = (days or 0) * 1440 + (hours or 0) * 60 + (minutes or 0) + (seconds or 0) / 60
@@ -516,7 +642,7 @@ async def editboss(
     if not changes:
         await interaction.response.send_message(
             "Nothing to change — pass at least one of respawn time, `role`, `emoji`, "
-            "`warn_minutes`, or `clear_role`.",
+            "`warn_minutes`, `clear_role`, or `board`.",
             ephemeral=True,
         )
         return
@@ -529,13 +655,17 @@ async def editboss(
     if timing_changed and boss in state["timers"]:
         note = (
             f"\n*{boss.title()} has a timer running — the new timing applies "
-            f"from its next `/died` report.*"
+            f"from its next `/d` report.*"
         )
 
     await interaction.response.send_message(
         f"✅ **{boss.title()}** updated.\n" + "\n".join(changes) + note, ephemeral=True
     )
-    await refresh_board(interaction.guild)
+    # A move has to redraw both boards: the timer leaves one list and joins the
+    # other, and only the boss's current board is refreshed by default.
+    await refresh_boss_board(interaction.guild, boss)
+    if moved_from is not None:
+        await refresh_board(interaction.guild, moved_from)
 
 
 @bot.tree.command(name="removeboss", description="Unregister a boss.")
@@ -559,14 +689,27 @@ async def bosses_cmd(interaction: discord.Interaction):
     if not state["bosses"]:
         await interaction.response.send_message("No bosses registered yet. Use `/addboss`.", ephemeral=True)
         return
-    # Shortest respawn first; name breaks ties so bosses on the same timer
-    # keep a stable order between calls.
-    ordered = sorted(state["bosses"].items(), key=lambda kv: (kv[1]["respawn_minutes"], kv[0]))
-    lines = [
-        f"• {boss_label(interaction.guild_id, name)} — {format_duration(cfg['respawn_minutes'])} respawn, "
-        f"{cfg['warn_minutes']}m warning, pings {resolve_ping(interaction.guild, cfg)}"
-        for name, cfg in ordered
-    ]
+    # Grouped by board, then shortest respawn first; name breaks ties so bosses
+    # on the same timer keep a stable order between calls.
+    lines = []
+    for category in BOARDS:
+        entries = [
+            (name, cfg) for name, cfg in state["bosses"].items()
+            if boss_category(interaction.guild_id, name) == category
+        ]
+        if not entries:
+            continue
+        if lines:
+            lines.append("")
+        channel_id = board_state(interaction.guild_id, category)["channel_id"]
+        where = f"<#{channel_id}>" if channel_id else f"*not set — `{BOARD_SETTERS[category]}`*"
+        lines.append(f"__**{BOARD_TITLES[category]}**__ — {where}")
+        lines.extend(
+            f"• {boss_label(interaction.guild_id, name)} — "
+            f"{format_duration(cfg['respawn_minutes'])} respawn, "
+            f"{cfg['warn_minutes']}m warning, pings {resolve_ping(interaction.guild, cfg)}"
+            for name, cfg in sorted(entries, key=lambda kv: (kv[1]["respawn_minutes"], kv[0]))
+        )
 
     # Sent as an embed: role mentions render as the role name but never notify
     # anyone from inside an embed, and the 4096-char description leaves room for
@@ -589,8 +732,7 @@ async def bosses_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# Slash commands have no alias mechanism — /died and /d are two registered
-# commands sharing one implementation and one set of parameter descriptions.
+# Option descriptions for /d.
 DIED_DESCRIPTIONS = {
     "boss": "Boss that died",
     "minute": "Minute it died at this hour (0-59) — leave empty if it just died",
@@ -613,8 +755,13 @@ async def report_death(
     if not boss_cfg:
         await interaction.response.send_message(f"**{boss}** is not registered. Use `/addboss` first.", ephemeral=True)
         return
-    if not state["board_channel_id"]:
-        await interaction.response.send_message("No timer board set yet. Ask an admin to run `/setboard`.", ephemeral=True)
+    category = boss_category(interaction.guild_id, boss)
+    if not board_state(interaction.guild_id, category)["channel_id"]:
+        await interaction.response.send_message(
+            f"No {BOARD_NOUNS[category]} board set yet. Ask an admin to run "
+            f"`{BOARD_SETTERS[category]}`.",
+            ephemeral=True,
+        )
         return
     if minute is not None and time is not None:
         await interaction.response.send_message("Provide either `minute` or `time`, not both.", ephemeral=True)
@@ -660,7 +807,7 @@ async def report_death(
 
     await interaction.response.send_message(f"✅ Timer started for **{boss.title()}**.", ephemeral=True)
 
-    channel = await get_board_channel(interaction.guild)
+    channel = await get_board_channel(interaction.guild, category)
     if channel:
         await channel.send(
             f"\U0001f480 {boss_label(interaction.guild_id, boss)} reported dead {died_note} "
@@ -673,20 +820,7 @@ async def report_death(
     )
 
 
-@bot.tree.command(name="died", description="Report a boss death and start its respawn timer.")
-@app_commands.describe(**DIED_DESCRIPTIONS)
-@app_commands.autocomplete(boss=boss_autocomplete)
-async def died(
-    interaction: discord.Interaction,
-    boss: str,
-    minute: int = None,
-    time: str = None,
-    utc_offset: float = 0.0,
-):
-    await report_death(interaction, boss, minute, time, utc_offset)
-
-
-@bot.tree.command(name="d", description="Report a boss death and start its respawn timer (short for /died).")
+@bot.tree.command(name="d", description="Report a boss death and start its respawn timer.")
 @app_commands.describe(**DIED_DESCRIPTIONS)
 @app_commands.autocomplete(boss=boss_autocomplete)
 async def died_short(
@@ -715,9 +849,61 @@ async def cancel(interaction: discord.Interaction, boss: str):
         task_map[boss].cancel()
     state["timers"].pop(boss, None)
     save_data(store)
-    await refresh_board(interaction.guild)
+    await refresh_boss_board(interaction.guild, boss)
 
     await interaction.response.send_message(f"\U0001f5d1️ Timer for **{boss.title()}** cancelled.")
+
+
+@bot.tree.command(name="cancelall", description="Cancel every active boss timer.")
+@app_commands.describe(board="Only cancel timers on this board (default: both)")
+async def cancelall(interaction: discord.Interaction, board: Literal["main", "mini"] = None):
+    state = guild_state(interaction.guild_id)
+    task_map = running_tasks.get(interaction.guild_id, {})
+
+    cancelled = sorted(
+        name for name in state["timers"]
+        if board is None or boss_category(interaction.guild_id, name) == board
+    )
+    if not cancelled:
+        scope = "" if board is None else f" on the {BOARD_NOUNS[board]} board"
+        await interaction.response.send_message(
+            f"No active timers{scope} to cancel.", ephemeral=True
+        )
+        return
+
+    affected = {boss_category(interaction.guild_id, name) for name in cancelled}
+    summary = ", ".join(boss_label(interaction.guild_id, name) for name in cancelled)
+    if len(summary) > 1500:
+        summary = f"*({len(cancelled)} timers — too many to list)*"
+
+    # Clear the stored timers before replying. That part is synchronous and
+    # cannot fail, so the reply can never claim a cancellation that did not
+    # happen, and the ack still lands well inside the 3-second deadline.
+    for name in cancelled:
+        state["timers"].pop(name, None)
+    save_data(store)
+
+    scope = "" if board is None else f" on the {BOARD_NOUNS[board]} board"
+    await interaction.response.send_message(
+        f"\U0001f5d1️ {interaction.user.mention} cancelled "
+        f"**{len(cancelled)}** timer{'s' if len(cancelled) != 1 else ''}{scope}: {summary}"
+    )
+
+    # Every cancelled task refreshes the board as it unwinds, but only the first
+    # spends an API call — the rest render an identical empty board and stop at
+    # the no-op cache check.
+    for name in cancelled:
+        task = task_map.pop(name, None)
+        if task is None:
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    for category in affected:
+        await refresh_board(interaction.guild, category)
 
 
 @bot.tree.command(name="seedpresets", description="Register the built-in preset bosses (convenience seed).")
@@ -725,15 +911,17 @@ async def cancel(interaction: discord.Interaction, boss: str):
 async def seedpresets(interaction: discord.Interaction):
     state = guild_state(interaction.guild_id)
     added = []
-    for name, respawn_minutes in BOSS_PRESETS.items():
-        if name not in state["bosses"]:
-            state["bosses"][name] = {
-                "respawn_minutes": respawn_minutes,
-                "warn_minutes": default_warn_minutes(respawn_minutes),
-                "role_id": None,
-                "emoji": None,
-            }
-            added.append(name.title())
+    for category in BOARDS:
+        for name, respawn_minutes in PRESETS_BY_BOARD[category].items():
+            if name not in state["bosses"]:
+                state["bosses"][name] = {
+                    "respawn_minutes": respawn_minutes,
+                    "warn_minutes": default_warn_minutes(respawn_minutes),
+                    "role_id": None,
+                    "emoji": None,
+                    "category": category,
+                }
+                added.append(name.title())
     save_data(store)
     await interaction.response.send_message(
         f"✅ Added: {', '.join(added)}" if added else "All presets were already registered.",
@@ -750,8 +938,9 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="Everyone",
         value=(
-            "`/died` (or `/d`) — report a boss death and start its timer\n"
+            "`/d` — report a boss death and start its timer\n"
             "`/cancel` — cancel an active timer\n"
+            "`/cancelall` — cancel every active timer (or one board's)\n"
             "`/bosses` — list registered bosses and their respawn times\n"
             "`/help` — this message"
         ),
@@ -760,9 +949,10 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="Admin (Manage Channels)",
         value=(
-            "`/setboard` — pick the channel for the timer list and pings\n"
+            "`/setboard` — pick the channel for the main boss list and pings\n"
+            "`/setminiboard` — pick the channel for the mini boss list and pings\n"
             "`/addboss` — register a boss\n"
-            "`/editboss` — change a boss's respawn time, ping role, or emoji\n"
+            "`/editboss` — change a boss's respawn time, ping role, emoji, or board\n"
             "`/removeboss` — unregister a boss\n"
             "`/seedpresets` — register the built-in preset bosses"
         ),
@@ -778,7 +968,18 @@ async def help_cmd(interaction: discord.Interaction):
         ),
         inline=False,
     )
-    embed.set_footer(text=f"Timer list refreshes every {BOARD_REFRESH_SECONDS}s")
+    embed.add_field(
+        name="Boards",
+        value=(
+            "Two independent lists, each in its own channel:\n"
+            f"• **{BOARD_TITLES['main']}** — `/setboard`\n"
+            f"• **{BOARD_TITLES['mini']}** — `/setminiboard`\n"
+            "A boss posts its warnings and respawn ping in its own board's "
+            "channel. Move one with `/editboss board:mini`."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"Timer lists refresh every {BOARD_REFRESH_SECONDS}s")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -788,13 +989,17 @@ async def help_cmd(interaction: discord.Interaction):
 async def board_refresher():
     for guild in bot.guilds:
         state = guild_state(guild.id)
-        # Nothing counting down means nothing to re-edit — skip the API call.
-        if not state["timers"] or not state["board_channel_id"]:
-            continue
-        try:
-            await refresh_board(guild)
-        except discord.HTTPException:
-            pass
+        for category in BOARDS:
+            # Nothing counting down on this board means nothing to re-edit —
+            # skip the API call.
+            if not board_state(guild.id, category)["channel_id"]:
+                continue
+            if not any(boss_category(guild.id, name) == category for name in state["timers"]):
+                continue
+            try:
+                await refresh_board(guild, category)
+            except discord.HTTPException:
+                pass
 
 
 @board_refresher.before_loop
@@ -821,7 +1026,7 @@ async def on_ready():
                 continue
             if respawns_at <= now:
                 state["timers"].pop(boss_name, None)
-                channel = await get_board_channel(guild)
+                channel = await get_board_channel(guild, boss_category(guild.id, boss_name))
                 if channel:
                     unix_ts = int(respawns_at.timestamp())
                     await channel.send(
@@ -837,7 +1042,8 @@ async def on_ready():
                 if existing is None or existing.done():
                     task_map[boss_name] = asyncio.create_task(_run_timer(guild, boss_name))
         save_data(store)
-        await refresh_board(guild)
+        for category in BOARDS:
+            await refresh_board(guild, category)
 
     # on_ready fires again on every gateway re-IDENTIFY, so guard the start.
     if not board_refresher.is_running():
