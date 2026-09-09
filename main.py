@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from dotenv import load_dotenv
@@ -14,11 +15,42 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_FILE = "data.json"
 
-# Warning rule: bosses with a short respawn get a 1-minute warning ping,
-# anything longer gets a 5-minute warning. Tweak the cutoff to taste.
+# Folder of per-boss emoji images, uploaded to the server and assigned to bosses
+# by /seedpresets and /syncemojis. One PNG/JPG/GIF per boss, named after the
+# boss: `faith.png`, `soul-lich.png`. Separators and case are ignored when
+# matching, so `Soul_Lich.PNG` finds `soul-lich` too. Override with EMOJI_DIR
+# in .env if you keep the images somewhere else.
+EMOJI_DIR = os.environ.get("EMOJI_DIR", "emojis")
+
+# Discord's limits for a custom emoji: the upload is rejected over 256 KB, and
+# the name must be 2-32 characters of letters, digits and underscores.
+EMOJI_FILE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif")
+EMOJI_MAX_BYTES = 256 * 1024
+
+# Warning rule: how far ahead of respawn the ping fires, chosen from how long
+# the boss takes to come back. Anything at or under the short cutoff gets a
+# 1-minute heads-up; past that, WARN_TIERS applies.
 SHORT_RESPAWN_CUTOFF_MINUTES = 60
 SHORT_WARN_MINUTES = 1
-LONG_WARN_MINUTES = 5
+LONG_WARN_MINUTES = 7
+
+# (respawn of at least this many minutes) -> warn this many minutes ahead.
+# Checked longest-first, so it reads as: 6 days or more -> 60m, 2 up to 6 days
+# -> 30m, 1 up to 2 days -> 15m. Anything under a day (but over the short
+# cutoff) falls through to LONG_WARN_MINUTES. Bounds are inclusive at the low
+# end, so a boss on exactly a 2-day timer gets the 30-minute warning.
+WARN_TIERS = (
+    (6 * 24 * 60, 60),
+    (2 * 24 * 60, 30),
+    (1 * 24 * 60, 15),
+)
+
+# Warn values the old two-step rule could produce. A boss still sitting on one
+# of these has never been customised, so the tiers above are applied to it once
+# (see WARN_RULE_VERSION); any other value came from `/editboss warn_minutes`
+# and is left alone.
+LEGACY_AUTO_WARN_MINUTES = (1, 5, 7)
+WARN_RULE_VERSION = 2
 
 # Who gets pinged by a warning when the boss has no role configured.
 DEFAULT_PING = "@everyone"
@@ -85,9 +117,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 #       "mini": {"channel_id": 789, "message_id": 111}
 #     },
 #     "bosses": {
-#       "faith": {"respawn_minutes": 353, "warn_minutes": 5, "role_id": null,
+#       "faith": {"respawn_minutes": 353, "warn_minutes": 7, "role_id": null,
 #                 "emoji": null, "category": "main"}
 #     },
+#     "warn_rule": 2,
 #     "timers": {
 #       "faith": {"respawns_at": "2026-08-16T05:53:00+00:00", "reported_by": "someone"}
 #     }
@@ -137,6 +170,13 @@ def guild_state(guild_id: int) -> dict:
     for category in BOARDS:
         boards.setdefault(category, {"channel_id": None, "message_id": None})
 
+    # One live reaction-role menu per board. `map` is {emoji string: boss name},
+    # keyed the way a raw reaction payload stringifies so the handler can look a
+    # reaction up without the message being cached.
+    menus = state.setdefault("reaction_roles", {})
+    for category in BOARDS:
+        menus.setdefault(category, {"channel_id": None, "message_id": None, "map": {}})
+
     # Migrate the old single-board schema. The existing board becomes the main
     # one and keeps its message id, so it is edited in place rather than
     # reposted — otherwise the channel ends up with two lists.
@@ -153,6 +193,15 @@ def guild_state(guild_id: int) -> dict:
     for name, cfg in state["bosses"].items():
         cfg.setdefault("category", default_category(name))
 
+    # One-time pass so a roster registered under the old two-step rule picks up
+    # the tiered warning times. Only values the old rule could have produced are
+    # re-derived — a boss whose warning was set by hand keeps it.
+    if state.get("warn_rule") != WARN_RULE_VERSION:
+        for name, cfg in state["bosses"].items():
+            if cfg.get("warn_minutes") in LEGACY_AUTO_WARN_MINUTES:
+                cfg["warn_minutes"] = default_warn_minutes(cfg["respawn_minutes"])
+        state["warn_rule"] = WARN_RULE_VERSION
+
     return state
 
 
@@ -166,8 +215,14 @@ def boss_category(guild_id: int, boss_name: str) -> str:
     return category if category in BOARDS else default_category(boss_name)
 
 
-def default_warn_minutes(respawn_minutes: int) -> int:
-    return SHORT_WARN_MINUTES if respawn_minutes <= SHORT_RESPAWN_CUTOFF_MINUTES else LONG_WARN_MINUTES
+def default_warn_minutes(respawn_minutes: float) -> int:
+    """How far ahead of respawn to ping, derived from the respawn length."""
+    if respawn_minutes <= SHORT_RESPAWN_CUTOFF_MINUTES:
+        return SHORT_WARN_MINUTES
+    for min_respawn_minutes, warn_minutes in WARN_TIERS:
+        if respawn_minutes >= min_respawn_minutes:
+            return warn_minutes
+    return LONG_WARN_MINUTES
 
 
 def format_duration(total_minutes: float) -> str:
@@ -435,6 +490,294 @@ async def active_timer_autocomplete(interaction: discord.Interaction, current: s
     ][:25]
 
 
+# ── Boss emoji sync ───────────────────────────────────────────────────────────
+# Discord has no way to show a local image inline, so each file in EMOJI_DIR is
+# uploaded once as a server custom emoji; what gets stored on the boss is the
+# `<:name:id>` reference the board and pings already render.
+
+def normalise_boss_key(text: str) -> str:
+    """Fold a boss name or filename to a comparable key: letters and digits only."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def emoji_name_for(boss_name: str) -> str:
+    """A Discord-legal custom emoji name: 2-32 chars of letters, digits, underscore."""
+    name = re.sub(r"[^A-Za-z0-9_]", "_", boss_name)[:32]
+    return name if len(name) >= 2 else f"boss_{name}"
+
+
+def scan_emoji_dir() -> dict:
+    """{normalised boss key: file path} for every usable image in EMOJI_DIR."""
+    found = {}
+    if not os.path.isdir(EMOJI_DIR):
+        return found
+    for entry in sorted(os.listdir(EMOJI_DIR)):
+        stem, ext = os.path.splitext(entry)
+        if ext.lower() not in EMOJI_FILE_EXTENSIONS:
+            continue
+        key = normalise_boss_key(stem)
+        # First match wins, so `faith.png` beats `Faith.PNG` on a case-sensitive
+        # filesystem rather than silently uploading both.
+        if key and key not in found:
+            found[key] = os.path.join(EMOJI_DIR, entry)
+    return found
+
+
+def emoji_sync_embed(guild_id: int, result: dict, seeded: list = None) -> discord.Embed:
+    """Turn a sync_boss_emojis() result into something readable in Discord."""
+    embed = discord.Embed(title="Boss emojis", color=discord.Color.blurple())
+
+    if seeded:
+        embed.add_field(
+            name=f"Registered ({len(seeded)})",
+            value=clip_names(", ".join(n.title() for n in seeded), len(seeded)),
+            inline=False,
+        )
+
+    if not result["files"]:
+        embed.color = discord.Color.dark_grey()
+        embed.description = (
+            f"No emoji images found in `{os.path.abspath(EMOJI_DIR)}`.\n"
+            "Drop one PNG/JPG/GIF per boss in that folder, named after the boss "
+            "(`faith.png`, `soul-lich.png`), then run this again."
+        )
+        return embed
+
+    def field(title, names):
+        if names:
+            embed.add_field(
+                name=f"{title} ({len(names)})",
+                value=clip_names(", ".join(boss_label(guild_id, n) for n in names), len(names)),
+                inline=False,
+            )
+
+    field("Uploaded and assigned", result["created"])
+    field("Assigned from an existing server emoji", result["reused"])
+    field("Left alone — already had an emoji", result["kept"])
+
+    if result["missing"]:
+        embed.add_field(
+            name=f"No image file ({len(result['missing'])})",
+            value=clip_names(", ".join(n.title() for n in result["missing"]),
+                             len(result["missing"])),
+            inline=False,
+        )
+    if result["failed"]:
+        embed.color = discord.Color.orange()
+        embed.add_field(
+            name=f"Failed ({len(result['failed'])})",
+            value="\n".join(f"• **{n.title()}** — {why}"
+                          for n, why in result["failed"])[:1000],
+            inline=False,
+        )
+    return embed
+
+
+def clip_names(text: str, count: int, limit: int = 1000) -> str:
+    """Embed fields cap at 1024 characters, so trim rather than lose the reply."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(",", 1)[0] + f", — ({count} total)"
+
+
+async def sync_boss_emojis(guild: discord.Guild, boss_names, overwrite: bool = False) -> dict:
+    """Give each named boss the server emoji built from its image file.
+
+    Reuses an existing server emoji of the same name rather than uploading a
+    duplicate, so re-running this is cheap and does not eat emoji slots.
+    """
+    state = guild_state(guild.id)
+    files = scan_emoji_dir()
+    result = {"created": [], "reused": [], "kept": [], "missing": [], "failed": [],
+              "files": len(files)}
+
+    for boss_name in boss_names:
+        cfg = state["bosses"].get(boss_name)
+        if cfg is None:
+            continue
+
+        path = files.get(normalise_boss_key(boss_name))
+        if path is None:
+            result["missing"].append(boss_name)
+            continue
+        if cfg.get("emoji") and not overwrite:
+            result["kept"].append(boss_name)
+            continue
+
+        emoji_name = emoji_name_for(boss_name)
+        existing = discord.utils.get(guild.emojis, name=emoji_name)
+        if existing is not None:
+            cfg["emoji"] = str(existing)
+            result["reused"].append(boss_name)
+            continue
+
+        try:
+            size = os.path.getsize(path)
+            if size > EMOJI_MAX_BYTES:
+                result["failed"].append(
+                    (boss_name, f"{size // 1024} KB — over Discord's 256 KB limit")
+                )
+                continue
+            with open(path, "rb") as fh:
+                image = fh.read()
+            created = await guild.create_custom_emoji(
+                name=emoji_name, image=image, reason=f"Boss timer emoji for {boss_name}"
+            )
+        except discord.Forbidden:
+            # Every remaining upload would fail identically, so stop here rather
+            # than filling the report with the same line 19 times.
+            result["failed"].append(
+                (boss_name, "the bot is missing the **Manage Expressions** permission")
+            )
+            break
+        except (discord.HTTPException, OSError) as exc:
+            result["failed"].append((boss_name, str(exc)))
+            continue
+
+        cfg["emoji"] = str(created)
+        result["created"].append(boss_name)
+
+    save_data(store)
+    return result
+
+
+# ── Reaction role menu ────────────────────────────────────────────────────────
+# A posted message listing bosses; reacting with a boss's emoji grants that
+# boss's ping role, un-reacting takes it away. The mapping is stored so the menu
+# keeps working after a restart, when the message is no longer cached.
+
+async def ensure_ping_role(guild: discord.Guild, boss_name: str, cfg: dict,
+                           create: bool = True) -> tuple:
+    """The role handed out for this boss, reusing or creating one as needed.
+
+    Returns (role, note) where note says what happened, for the admin's report.
+    With create=False, returns (None, "missing") instead of making a new role.
+    """
+    role = guild.get_role(cfg["role_id"]) if cfg.get("role_id") else None
+    if role is not None:
+        return role, "existing"
+
+    # Match an existing role by name before making another one, so re-running
+    # this after clearing a role_id does not litter the server with duplicates.
+    role_name = boss_name.title()
+    role = discord.utils.get(guild.roles, name=role_name)
+    if role is not None:
+        cfg["role_id"] = role.id
+        return role, "adopted"
+
+    if not create:
+        return None, "missing"
+
+    role = await guild.create_role(
+        name=role_name, mentionable=True,
+        reason=f"Boss timer ping role for {boss_name}",
+    )
+    cfg["role_id"] = role.id
+    return role, "created"
+
+
+def build_reaction_role_embed(guild_id: int, category: str, entries: list) -> discord.Embed:
+    lines = [
+        f"{boss_label(guild_id, name)} — {role.mention}"
+        for name, _emoji, role in entries
+    ]
+    return discord.Embed(
+        title=f"{BOARD_TITLES[category]} — ping roles",
+        description=(
+            "React with a boss's emoji to get pinged before it respawns.\n"
+            "Remove your reaction to stop being pinged for it.\n\n"
+            + "\n".join(lines)
+        ),
+        color=discord.Color.blurple(),
+    )
+
+
+def reaction_role_report(guild_id: int, category: str, message, no_emoji: list,
+                         no_role: list, made_roles: list) -> discord.Embed:
+    """What the admin who ran /reactroles sees: what posted, and what did not."""
+    embed = discord.Embed(title=f"{BOARD_NOUNS[category].title()} ping roles",
+                          color=discord.Color.blurple())
+    if message is None:
+        embed.color = discord.Color.orange()
+        embed.description = (
+            f"Nothing to post — no {BOARD_NOUNS[category]} has both an emoji and a "
+            f"ping role.\n Add emojis with `/syncemojis`, then run this again."
+        )
+    else:
+        embed.description = f"Menu posted: {message.jump_url}"
+
+    if made_roles:
+        embed.add_field(
+            name=f"Roles created ({len(made_roles)})",
+            value=clip_names(", ".join(n.title() for n in made_roles), len(made_roles)),
+            inline=False,
+        )
+    if no_emoji:
+        embed.add_field(
+            name=f"Skipped — no emoji ({len(no_emoji)})",
+            value=clip_names(", ".join(n.title() for n in no_emoji), len(no_emoji))
+                  + "\nGive them an image in the emoji folder and run `/syncemojis`.",
+            inline=False,
+        )
+    if no_role:
+        embed.color = discord.Color.orange()
+        embed.add_field(
+            name=f"Skipped — role problem ({len(no_role)})",
+            value="\n".join(f"• **{n.title()}** — {why}" for n, why in no_role)[:1000],
+            inline=False,
+        )
+    return embed
+
+
+async def handle_reaction_role(payload, adding: bool) -> None:
+    """Grant or remove a boss ping role from a reaction on a stored menu."""
+    if payload.guild_id is None or payload.user_id == bot.user.id:
+        return
+
+    state = guild_state(payload.guild_id)
+    menu = next(
+        (m for m in state["reaction_roles"].values() if m.get("message_id") == payload.message_id),
+        None,
+    )
+    if menu is None:
+        return
+
+    boss_name = menu["map"].get(str(payload.emoji))
+    if boss_name is None:
+        return
+    cfg = state["bosses"].get(boss_name)
+    if not cfg or not cfg.get("role_id"):
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    role = guild.get_role(cfg["role_id"])
+    if role is None:
+        return
+
+    # payload.member is only populated on add, and the members intent is off, so
+    # fall back to a REST fetch rather than an empty cache lookup.
+    member = payload.member if adding else None
+    if member is None:
+        member = guild.get_member(payload.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except discord.HTTPException:
+            return
+    if member.bot:
+        return
+
+    try:
+        if adding:
+            await member.add_roles(role, reason="Boss timer reaction role")
+        else:
+            await member.remove_roles(role, reason="Boss timer reaction role")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 # ── Commands ───────────────────────────────────────────────────────────────────
 
 async def set_board(interaction: discord.Interaction, category: str, channel: discord.TextChannel) -> None:
@@ -494,7 +837,7 @@ async def setminiboard(interaction: discord.Interaction, channel: discord.TextCh
     name="Boss name",
     days="Respawn days", hours="Respawn hours", minutes="Respawn minutes", seconds="Respawn seconds",
     role="Role to ping on the warning (optional)",
-    warn_minutes="Override the auto warning time (optional — default is 1 or 5 min based on respawn length)",
+    warn_minutes="Override the auto warning time (optional — default scales with respawn length)",
     board="Which board this boss belongs to (default: main)",
 )
 @app_commands.checks.has_permissions(manage_channels=True)
@@ -906,9 +1249,13 @@ async def cancelall(interaction: discord.Interaction, board: Literal["main", "mi
         await refresh_board(interaction.guild, category)
 
 
-@bot.tree.command(name="seedpresets", description="Register the built-in preset bosses (convenience seed).")
+@bot.tree.command(name="seedpresets", description="Register the built-in preset bosses and set up their emojis.")
+@app_commands.describe(overwrite="Replace emojis already set on a boss (default: only fill in blanks)")
 @app_commands.checks.has_permissions(manage_channels=True)
-async def seedpresets(interaction: discord.Interaction):
+async def seedpresets(interaction: discord.Interaction, overwrite: bool = False):
+    # Uploading emoji images takes far longer than the 3-second interaction
+    # deadline allows, so acknowledge first and report once the work is done.
+    await interaction.response.defer(ephemeral=True)
     state = guild_state(interaction.guild_id)
     added = []
     for category in BOARDS:
@@ -921,12 +1268,129 @@ async def seedpresets(interaction: discord.Interaction):
                     "emoji": None,
                     "category": category,
                 }
-                added.append(name.title())
+                added.append(name)
     save_data(store)
-    await interaction.response.send_message(
-        f"✅ Added: {', '.join(added)}" if added else "All presets were already registered.",
+
+    # Runs over every preset boss, not just the ones just added, so an existing
+    # roster picks up its emojis too.
+    preset_names = [name for category in BOARDS for name in PRESETS_BY_BOARD[category]]
+    result = await sync_boss_emojis(
+        interaction.guild,
+        [n for n in preset_names if n in state["bosses"]],
+        overwrite=overwrite,
+    )
+    embed = emoji_sync_embed(interaction.guild_id, result, seeded=added)
+    if not added:
+        embed.set_footer(text="All presets were already registered.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    for category in BOARDS:
+        await refresh_board(interaction.guild, category)
+
+
+@bot.tree.command(name="reactroles", description="Post a react-for-ping-role menu in this channel.")
+@app_commands.describe(
+    board="Which board's bosses to list (default: mini)",
+    create_roles="Create a ping role for any boss that has none (default: yes)",
+)
+@app_commands.checks.has_permissions(manage_roles=True)
+async def reactroles(
+    interaction: discord.Interaction,
+    board: Literal["main", "mini"] = "mini",
+    create_roles: bool = True,
+):
+    # Creating roles and adding one reaction per boss is many API calls, well
+    # past the 3-second interaction deadline.
+    await interaction.response.defer(ephemeral=True)
+    state = guild_state(interaction.guild_id)
+    guild = interaction.guild
+
+    entries, no_emoji, no_role, made_roles = [], [], [], []
+    for name in sorted(n for n in state["bosses"] if boss_category(guild.id, n) == board):
+        cfg = state["bosses"][name]
+        # A menu entry is a reaction, so a boss with no emoji has nothing to
+        # react with — skip it and say so rather than posting a blank row.
+        if not cfg.get("emoji"):
+            no_emoji.append(name)
+            continue
+        try:
+            role, note = await ensure_ping_role(guild, name, cfg, create=create_roles)
+        except discord.Forbidden:
+            no_role.append((name, "the bot is missing the **Manage Roles** permission"))
+            continue
+        except discord.HTTPException as exc:
+            no_role.append((name, str(exc)))
+            continue
+        if role is None:
+            no_role.append((name, "no ping role set, and `create_roles` was off"))
+            continue
+        if note == "created":
+            made_roles.append(name)
+        entries.append((name, cfg["emoji"], role))
+
+    save_data(store)
+
+    if not entries:
+        await interaction.followup.send(
+            embed=reaction_role_report(guild.id, board, None, no_emoji, no_role, made_roles),
+            ephemeral=True,
+        )
+        return
+
+    # Replace any previous menu for this board, so only one message is live and
+    # reactions on a stale copy cannot silently do nothing.
+    menu = state["reaction_roles"][board]
+    if menu.get("message_id") and menu.get("channel_id"):
+        old_channel = guild.get_channel(menu["channel_id"])
+        if old_channel is not None:
+            try:
+                old = await old_channel.fetch_message(menu["message_id"])
+                await old.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    message = await interaction.channel.send(
+        embed=build_reaction_role_embed(guild.id, board, entries)
+    )
+
+    emoji_map = {}
+    for name, emoji, _role in entries:
+        partial = discord.PartialEmoji.from_str(emoji)
+        try:
+            await message.add_reaction(partial)
+        except (discord.Forbidden, discord.HTTPException):
+            no_role.append((name, "the bot could not add its reaction"))
+            continue
+        emoji_map[str(partial)] = name
+
+    state["reaction_roles"][board] = {
+        "channel_id": interaction.channel.id,
+        "message_id": message.id,
+        "map": emoji_map,
+    }
+    save_data(store)
+
+    await interaction.followup.send(
+        embed=reaction_role_report(guild.id, board, message, no_emoji, no_role, made_roles),
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="syncemojis", description="Upload the emoji images folder and assign them to bosses.")
+@app_commands.describe(overwrite="Replace emojis already set on a boss (default: only fill in blanks)")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def syncemojis(interaction: discord.Interaction, overwrite: bool = False):
+    await interaction.response.defer(ephemeral=True)
+    state = guild_state(interaction.guild_id)
+    result = await sync_boss_emojis(
+        interaction.guild, sorted(state["bosses"]), overwrite=overwrite
+    )
+    await interaction.followup.send(
+        embed=emoji_sync_embed(interaction.guild_id, result), ephemeral=True
+    )
+
+    for category in BOARDS:
+        await refresh_board(interaction.guild, category)
 
 
 @bot.tree.command(name="help", description="How to use the boss timer bot.")
@@ -954,7 +1418,9 @@ async def help_cmd(interaction: discord.Interaction):
             "`/addboss` — register a boss\n"
             "`/editboss` — change a boss's respawn time, ping role, emoji, or board\n"
             "`/removeboss` — unregister a boss\n"
-            "`/seedpresets` — register the built-in preset bosses"
+            "`/seedpresets` — register the built-in preset bosses, with emojis\n"
+            f"`/syncemojis` — upload `{EMOJI_DIR}/` images and assign them to bosses\n"
+            "`/reactroles` — post a react-for-ping-role menu in the current channel"
         ),
         inline=False,
     )
@@ -1005,6 +1471,16 @@ async def board_refresher():
 @board_refresher.before_loop
 async def before_board_refresher():
     await bot.wait_until_ready()
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    await handle_reaction_role(payload, adding=True)
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    await handle_reaction_role(payload, adding=False)
 
 
 @bot.event
