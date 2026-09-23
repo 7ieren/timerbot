@@ -1534,7 +1534,7 @@ async def help_cmd(interaction: discord.Interaction):
         name="Quick reports (type in a board channel)",
         value=(
             "`faith d` — it just died\n"
-            "`lich d :55` or `lich d 55` — died at :55\n"
+            "`lich d :55`, `lich d 55` or `lich d55` — died at :55\n"
             "`ak d 12:10`, `:12:10` or `12.10` — died at 12m 10s past the hour\n"
             "Short names work (`lich`, `ak`, `whale`…), as does any unambiguous "
             "start of a name. ✅ means the timer started."
@@ -1583,14 +1583,15 @@ async def before_board_refresher():
 # A plain-text death report typed in a board channel: `<boss> d [when]`, where
 # the boss is up to three words (full name, short name or unique prefix) and
 # `when` is minutes past this hour, optionally with seconds — the leading colon
-# is optional and `:` or `.` separates the two:
+# is optional, `:` or `.` separates the two, and the space after `d` is
+# optional too (`apa d08`, `apa d12:10`):
 #   :55  or 55                                  minute 55
 #   :12:10  or 12:10  or :12.10  or 12.10       minute 12, second 10
 # There is no time-of-day form here; `/d time:` covers that. Anything that
 # doesn't fit this shape is ordinary chat and is ignored.
 TEXT_DEATH_REPORT = re.compile(
     r"^\s*(?P<name>\S+(?:\s+\S+){0,2}?)\s+(?:d|died|dead)"
-    r"(?:\s+(?P<when>:?\d{1,2}(?:[:.]\d{2})?))?\s*$",
+    r"(?:\s*(?P<when>:?\d{1,2}(?:[:.]\d{2})?))?\s*$",
     re.IGNORECASE,
 )
 

@@ -57,11 +57,12 @@ Instead of `/d`, type a death straight into either board channel:
 | Message | Meaning |
 |---|---|
 | `faith d` | died just now |
-| `lich d :55` or `lich d 55` | died at :55 this hour |
+| `lich d :55`, `lich d 55` or `lich d55` | died at :55 this hour |
 | `ak d 12:10`, `ak d :12:10`, `ak d 12.10` or `ak d :12.10` | died at 12 min 10 sec past this hour |
 
 Times in a quick report are always minutes (and optionally seconds) past the
-current hour — the leading colon is optional. A minute or second that hasn't
+current hour — the leading colon and the space after `d` are both optional
+(`apa d08`, `apa d12:10`). A minute or second that hasn't
 happened yet this hour is taken as last hour. To report an exact time of day,
 use `/d time:`.
 
