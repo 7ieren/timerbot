@@ -7,7 +7,7 @@ import math
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Literal, NamedTuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -92,6 +92,31 @@ MINI_BOSS_PRESETS = {
     "glucose":  30,
     "overload": 30,
     "apapa":    15,
+    "inspector": 60,
+    "morty":     59 + 45 / 60,
+    "snakezard": 8 * 60 + 43 + 20 / 60,
+}
+
+# Short names accepted anywhere a boss name is typed: `/d boss:lich` or a text
+# report like `lich d :55`. Matching ignores case, spaces and hyphens. Beyond
+# these, any unambiguous start of a boss name also works (`plata` -> platanista).
+BOSS_ALIASES = {
+    "actaemon":    ("acta", "actae"),
+    "billiard":    ("billi", "bili", "bill"),
+    "soul-lich":   ("lich",),
+    "barslaf":     ("bars",),
+    "bigmama":     ("bmm",),
+    "ukpana":      ("ukkie", "ukie"),
+    "darlene":     ("witch",),
+    "sephia":      ("seph",),
+    "caligo":      ("cali",),
+    "platanista":  ("whale",),
+    "apapa":       ("apa",),
+    "overload":    ("ol",),
+    "glucose":     ("gluc", "glu"),
+    "awakenkooii": ("ak", "awaken"),
+    "wadangka":    ("wdk",),
+    "devilang":    ("devi",),
 }
 
 # The two boards. Each lives in its own channel and shows only the timers for
@@ -373,14 +398,21 @@ async def refresh_boss_board(guild: discord.Guild, boss_name: str, repost: bool 
 
 # ── Timer logic ───────────────────────────────────────────────────────────────
 
-def resolve_died_at(now: datetime, died_at_minute: int | None, died_at_dt: datetime | None) -> datetime:
+def resolve_died_at(
+    now: datetime,
+    died_at_minute: int | None,
+    died_at_dt: datetime | None,
+    died_at_second: int | None = None,
+) -> datetime:
     """The moment the boss actually died, from whichever form the reporter gave."""
     if died_at_dt is not None:
         return died_at_dt
     if died_at_minute is not None:
-        # ":47" means the most recent :47 at or before now.
-        elapsed_mins = (now.minute - died_at_minute) % 60
-        return now - timedelta(minutes=elapsed_mins, seconds=now.second, microseconds=now.microsecond)
+        # ":47" (or ":47:10") means the most recent :47 (:47:10) at or before now.
+        died_at = now.replace(minute=died_at_minute, second=died_at_second or 0, microsecond=0)
+        if died_at > now:
+            died_at -= timedelta(hours=1)
+        return died_at
     return now
 
 
@@ -474,10 +506,12 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
 
 async def boss_autocomplete(interaction: discord.Interaction, current: str):
     bosses = guild_state(interaction.guild_id)["bosses"]
+    typed = normalise_boss_key(current)
     return [
         app_commands.Choice(name=name, value=name)
         for name in bosses
-        if current.lower() in name.lower()
+        if typed in normalise_boss_key(name)
+        or any(alias.startswith(typed) for alias in BOSS_ALIASES.get(name, ()))
     ][:25]
 
 
@@ -1077,48 +1111,94 @@ async def bosses_cmd(interaction: discord.Interaction):
 
 # Option descriptions for /d.
 DIED_DESCRIPTIONS = {
-    "boss": "Boss that died",
+    "boss": "Boss that died — short names like `lich` or `ak` work too",
     "minute": "Minute it died at this hour (0-59) — leave empty if it just died",
+    "second": "Second within that minute (0-59) — optional, needs `minute`",
     "time": "Exact time it died, e.g. 14:30 or 23/05 14:30 (UTC unless utc_offset is set)",
     "utc_offset": "Your UTC offset, e.g. 8 for UTC+8. Default 0.",
 }
 
 
-async def report_death(
-    interaction: discord.Interaction,
+class DeathReportError(Exception):
+    """A death report that can't become a timer; the text is shown to the reporter."""
+
+
+# {normalised short name: boss name}. Built once so a clash between two bosses'
+# short names fails loudly at startup instead of silently picking one.
+BOSS_ALIAS_LOOKUP = {}
+for _boss, _aliases in BOSS_ALIASES.items():
+    for _alias in _aliases:
+        _key = normalise_boss_key(_alias)
+        if BOSS_ALIAS_LOOKUP.get(_key, _boss) != _boss:
+            raise ValueError(f"Short name {_alias!r} is used by both {_boss} and {BOSS_ALIAS_LOOKUP[_key]}")
+        BOSS_ALIAS_LOOKUP[_key] = _boss
+
+
+def lookup_boss(guild_id: int, text: str) -> str:
+    """Resolve typed text to a registered boss: full name, short name, or unique prefix."""
+    bosses = guild_state(guild_id)["bosses"]
+    key = normalise_boss_key(text)
+    if not key:
+        raise DeathReportError("Which boss? Give a name, e.g. `faith d`.")
+
+    by_key = {normalise_boss_key(name): name for name in bosses}
+    if key in by_key:
+        return by_key[key]
+
+    alias = BOSS_ALIAS_LOOKUP.get(key)
+    if alias in bosses:
+        return alias
+
+    matches = sorted(name for k, name in by_key.items() if k.startswith(key))
+    if len(matches) == 1 and len(key) >= 2:
+        return matches[0]
+    if len(matches) > 1:
+        raise DeathReportError(
+            f"**{text}** could be {', '.join(n.title() for n in matches[:6])} — be more specific."
+        )
+    raise DeathReportError(f"**{text}** isn't a registered boss or short name.")
+
+
+class DeathPlan(NamedTuple):
+    boss: str
+    category: str
+    died_at: datetime
+    respawns_at: datetime
+
+
+def plan_death(
+    guild_id: int,
     boss: str,
     minute: int = None,
     time: str = None,
     utc_offset: float = 0.0,
-):
-    state = guild_state(interaction.guild_id)
-    boss = boss.lower()
-    boss_cfg = state["bosses"].get(boss)
+    second: int = None,
+) -> DeathPlan:
+    """Validate a death report without touching Discord. Raises DeathReportError."""
+    boss = lookup_boss(guild_id, boss)
+    boss_cfg = guild_state(guild_id)["bosses"][boss]
 
-    if not boss_cfg:
-        await interaction.response.send_message(f"**{boss}** is not registered. Use `/addboss` first.", ephemeral=True)
-        return
-    category = boss_category(interaction.guild_id, boss)
-    if not board_state(interaction.guild_id, category)["channel_id"]:
-        await interaction.response.send_message(
+    category = boss_category(guild_id, boss)
+    if not board_state(guild_id, category)["channel_id"]:
+        raise DeathReportError(
             f"No {BOARD_NOUNS[category]} board set yet. Ask an admin to run "
-            f"`{BOARD_SETTERS[category]}`.",
-            ephemeral=True,
+            f"`{BOARD_SETTERS[category]}`."
         )
-        return
     if minute is not None and time is not None:
-        await interaction.response.send_message("Provide either `minute` or `time`, not both.", ephemeral=True)
-        return
+        raise DeathReportError("Provide either `minute` or `time`, not both.")
     if minute is not None and not (0 <= minute <= 59):
-        await interaction.response.send_message("Minute must be between 0 and 59.", ephemeral=True)
-        return
+        raise DeathReportError("Minute must be between 0 and 59.")
+    if second is not None and minute is None:
+        raise DeathReportError("A second needs a minute with it, e.g. `:12:10`.")
+    if second is not None and not (0 <= second <= 59):
+        raise DeathReportError("Second must be between 0 and 59.")
 
     now = datetime.now(timezone.utc)
     died_at_dt = None
 
     if time is not None:
         try:
-            if " " in time:
+            if " " in time.strip():
                 date_part, time_part = time.strip().split(" ", 1)
                 day, month = (int(x) for x in date_part.split("/"))
                 hour, mins = (int(x) for x in time_part.split(":"))
@@ -1132,35 +1212,50 @@ async def report_death(
             if died_at_dt > now:
                 died_at_dt -= timedelta(days=1)
         except (ValueError, TypeError):
-            await interaction.response.send_message(
-                "Invalid time format. Use `HH:MM` or `DD/MM HH:MM`.", ephemeral=True
-            )
-            return
+            raise DeathReportError("Invalid time format. Use `HH:MM` or `DD/MM HH:MM`.") from None
 
-    died_at = resolve_died_at(now, minute, died_at_dt)
-    died_ts = int(died_at.timestamp())
-    died_note = f"at <t:{died_ts}:t> (<t:{died_ts}:R>)"
-
+    died_at = resolve_died_at(now, minute, died_at_dt, second)
     respawns_at = died_at + timedelta(minutes=boss_cfg["respawn_minutes"])
     if respawns_at <= now:
-        await interaction.response.send_message(
-            "That death time is further back than the respawn timer — it would already be up.", ephemeral=True
+        raise DeathReportError(
+            "That death time is further back than the respawn timer — it would already be up."
         )
-        return
+    return DeathPlan(boss, category, died_at, respawns_at)
 
-    await interaction.response.send_message(f"✅ Timer started for **{boss.title()}**.", ephemeral=True)
 
-    channel = await get_board_channel(interaction.guild, category)
+async def commit_death(guild: discord.Guild, plan: DeathPlan, reporter: discord.abc.User) -> None:
+    """Announce a validated death and start its timer."""
+    died_ts = int(plan.died_at.timestamp())
+    channel = await get_board_channel(guild, plan.category)
     if channel:
         await channel.send(
-            f"\U0001f480 {boss_label(interaction.guild_id, boss)} reported dead {died_note} "
-            f"by {interaction.user.mention}."
+            f"\U0001f480 {boss_label(guild.id, plan.boss)} reported dead at <t:{died_ts}:t> "
+            f"(<t:{died_ts}:R>) by {reporter.mention}."
         )
 
     # Repost last so the refreshed timer list is the newest message in the channel.
-    await start_timer(
-        interaction.guild, boss, respawns_at, reported_by=str(interaction.user), repost=True
+    await start_timer(guild, plan.boss, plan.respawns_at, reported_by=str(reporter), repost=True)
+
+
+async def report_death(
+    interaction: discord.Interaction,
+    boss: str,
+    minute: int = None,
+    time: str = None,
+    utc_offset: float = 0.0,
+    second: int = None,
+):
+    try:
+        plan = plan_death(interaction.guild_id, boss, minute, time, utc_offset, second)
+    except DeathReportError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    # Acknowledge before the board repost, which can outrun the 3-second deadline.
+    await interaction.response.send_message(
+        f"✅ Timer started for **{plan.boss.title()}**.", ephemeral=True
     )
+    await commit_death(interaction.guild, plan, interaction.user)
 
 
 @bot.tree.command(name="d", description="Report a boss death and start its respawn timer.")
@@ -1172,8 +1267,9 @@ async def died_short(
     minute: int = None,
     time: str = None,
     utc_offset: float = 0.0,
+    second: int = None,
 ):
-    await report_death(interaction, boss, minute, time, utc_offset)
+    await report_death(interaction, boss, minute, time, utc_offset, second)
 
 
 @bot.tree.command(name="cancel", description="Cancel an active boss timer.")
@@ -1435,6 +1531,17 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
+        name="Quick reports (type in a board channel)",
+        value=(
+            "`faith d` — it just died\n"
+            "`lich d :55` or `lich d 55` — died at :55\n"
+            "`ak d 12:10`, `:12:10` or `12.10` — died at 12m 10s past the hour\n"
+            "Short names work (`lich`, `ak`, `whale`…), as does any unambiguous "
+            "start of a name. ✅ means the timer started."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="Boards",
         value=(
             "Two independent lists, each in its own channel:\n"
@@ -1471,6 +1578,67 @@ async def board_refresher():
 @board_refresher.before_loop
 async def before_board_refresher():
     await bot.wait_until_ready()
+
+
+# A plain-text death report typed in a board channel: `<boss> d [when]`, where
+# the boss is up to three words (full name, short name or unique prefix) and
+# `when` is minutes past this hour, optionally with seconds — the leading colon
+# is optional and `:` or `.` separates the two:
+#   :55  or 55                                  minute 55
+#   :12:10  or 12:10  or :12.10  or 12.10       minute 12, second 10
+# There is no time-of-day form here; `/d time:` covers that. Anything that
+# doesn't fit this shape is ordinary chat and is ignored.
+TEXT_DEATH_REPORT = re.compile(
+    r"^\s*(?P<name>\S+(?:\s+\S+){0,2}?)\s+(?:d|died|dead)"
+    r"(?:\s+(?P<when>:?\d{1,2}(?:[:.]\d{2})?))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_report_time(when: str | None) -> tuple:
+    """(minute, second) from the `when` part of a text report."""
+    if not when:
+        return None, None
+    parts = re.split(r"[:.]", when.lstrip(":"))
+    minute = int(parts[0])
+    second = int(parts[1]) if len(parts) > 1 else None
+    return minute, second
+
+
+@bot.listen("on_message")
+async def text_death_report(message: discord.Message):
+    if message.author.bot or message.guild is None:
+        return
+    # Only messages posted directly in this server's two board channels. A thread
+    # has its own channel id, so threads opened inside a board channel are
+    # deliberately ignored too.
+    boards = guild_state(message.guild.id)["boards"].values()
+    if message.channel.id not in {b["channel_id"] for b in boards if b["channel_id"]}:
+        return
+    match = TEXT_DEATH_REPORT.match(message.content)
+    if match is None:
+        return
+
+    minute, second = parse_report_time(match["when"])
+
+    try:
+        plan = plan_death(message.guild.id, match["name"], minute, second=second)
+    except DeathReportError as exc:
+        # Short-lived reply so mistakes don't clutter the board channel.
+        await add_reaction_quietly(message, "❌")
+        await message.reply(str(exc), mention_author=False, delete_after=15)
+        return
+
+    await add_reaction_quietly(message, "✅")
+    await commit_death(message.guild, plan, message.author)
+
+
+async def add_reaction_quietly(message: discord.Message, emoji: str) -> None:
+    """A reaction is only feedback, so a missing permission shouldn't stop the report."""
+    try:
+        await message.add_reaction(emoji)
+    except discord.HTTPException:
+        pass
 
 
 @bot.event

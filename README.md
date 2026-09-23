@@ -25,10 +25,12 @@ posted in its own board's channel.
 
 ### Everyone
 
-- `/d boss [minute] [time] [utc_offset]` — report a death and start the timer
+- `/d boss [minute] [second] [time] [utc_offset]` — report a death and start the timer
   - no args: died just now
   - `minute:55` — died at :55 this hour
+  - `minute:12 second:10` — died at 12m 10s past this hour
   - `time:14:30` / `time:23/05 14:30` — died at an exact UTC time (add `utc_offset` for local time)
+- Quick report — type in either board channel (see [Quick reports](#quick-reports))
 - `/cancel boss` — cancel a running timer
 - `/cancelall [board]` — cancel every running timer, or only one board's
 - `/bosses` — list registered bosses grouped by board, with respawn time, warning time and ping role
@@ -47,6 +49,55 @@ posted in its own board's channel.
 ### Admin (Manage Roles)
 
 - `/reactroles [board] [create_roles]` — post a reaction-role menu in the current channel (default: mini bosses)
+
+## Quick reports
+
+Instead of `/d`, type a death straight into either board channel:
+
+| Message | Meaning |
+|---|---|
+| `faith d` | died just now |
+| `lich d :55` or `lich d 55` | died at :55 this hour |
+| `ak d 12:10`, `ak d :12:10`, `ak d 12.10` or `ak d :12.10` | died at 12 min 10 sec past this hour |
+
+Times in a quick report are always minutes (and optionally seconds) past the
+current hour — the leading colon is optional. A minute or second that hasn't
+happened yet this hour is taken as last hour. To report an exact time of day,
+use `/d time:`.
+
+- The bot reacts ✅ when the timer starts. On a mistake it reacts ❌ and replies
+  with the reason; the reply deletes itself after 15 seconds.
+- Either board channel works; the timer goes to the boss's own board.
+- `d`, `died` and `dead` are all accepted. Messages that don't fit the pattern
+  are treated as normal chat and ignored.
+- Requires the **Message Content Intent** to be enabled for the bot in the
+  Discord Developer Portal (Bot → Privileged Gateway Intents).
+
+### Boss names
+
+Anywhere a boss name is typed (`/d` or a quick report), you can use the full
+name, a short name, or any unambiguous start of a name (`plata` → Platanista).
+Case, spaces and hyphens don't matter. Short names are set in `BOSS_ALIASES`
+at the top of `main.py`:
+
+| Boss | Short names |
+|---|---|
+| Actaemon | acta, actae |
+| Billiard | billi, bili, bill |
+| Soul-Lich | lich |
+| Barslaf | bars |
+| Bigmama | bmm |
+| Ukpana | ukkie, ukie |
+| Darlene | witch |
+| Sephia | seph |
+| Caligo | cali |
+| Platanista | whale |
+| Apapa | apa |
+| Overload | ol |
+| Glucose | gluc, glu |
+| Awakenkooii | ak, awaken |
+| Wadangka | wdk |
+| Devilang | devi |
 
 ## Boards
 
