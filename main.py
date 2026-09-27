@@ -307,7 +307,7 @@ def build_board_embed(guild_id: int, category: str) -> discord.Embed:
         unix_ts = int(respawns_at.timestamp())
         rows.append(
             f"{boss_label(guild_id, boss_name)} — **{format_remaining(respawns_at, now)}** "
-            f"(<t:{unix_ts}:t>)"
+            f"(<t:{unix_ts}:T>)"
         )
 
     embed = discord.Embed(
@@ -468,7 +468,7 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
             if channel:
                 warn_msg = await channel.send(
                     f"{resolve_ping(guild, boss_cfg)} {boss_label(guild.id, boss_name)} "
-                    f"respawns in **{boss_cfg['warn_minutes']}m** — <t:{unix_ts}:t>"
+                    f"respawns in **{boss_cfg['warn_minutes']}m** — <t:{unix_ts}:T>"
                 )
 
         now = datetime.now(timezone.utc)
@@ -478,7 +478,7 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
 
         respawned_text = (
             f"{resolve_ping(guild, boss_cfg)} {boss_label(guild.id, boss_name)} "
-            f"has respawned at <t:{unix_ts}:t> (<t:{unix_ts}:R>)"
+            f"has respawned at <t:{unix_ts}:T> (<t:{unix_ts}:R>)"
         )
         if warn_msg is not None:
             try:
@@ -1229,7 +1229,7 @@ async def commit_death(guild: discord.Guild, plan: DeathPlan, reporter: discord.
     channel = await get_board_channel(guild, plan.category)
     if channel:
         await channel.send(
-            f"\U0001f480 {boss_label(guild.id, plan.boss)} reported dead at <t:{died_ts}:t> "
+            f"\U0001f480 {boss_label(guild.id, plan.boss)} reported dead at <t:{died_ts}:T> "
             f"(<t:{died_ts}:R>) by {reporter.mention}."
         )
 
@@ -1675,7 +1675,7 @@ async def on_ready():
                 if channel:
                     unix_ts = int(respawns_at.timestamp())
                     await channel.send(
-                        f"{boss_label(guild.id, boss_name)} respawned at <t:{unix_ts}:t> "
+                        f"{boss_label(guild.id, boss_name)} respawned at <t:{unix_ts}:T> "
                         f"(<t:{unix_ts}:R>) while the bot was offline."
                     )
             else:
