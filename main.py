@@ -1705,6 +1705,16 @@ async def on_app_command_error(interaction: discord.Interaction, error):
         raise error
 
 
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    # The bot has no prefix commands, so a message like `!cat` is meant for some
+    # other bot in the server. Ignore it rather than logging an error each time.
+    if isinstance(error, commands.CommandNotFound):
+        return
+    # Anything else is a real problem: fall back to discord.py's default logging.
+    await commands.Bot.on_command_error(bot, ctx, error)
+
+
 if __name__ == "__main__":
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
