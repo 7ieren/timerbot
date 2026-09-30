@@ -28,16 +28,18 @@ EMOJI_FILE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif")
 EMOJI_MAX_BYTES = 256 * 1024
 
 # Warning rule: how far ahead of respawn the ping fires, chosen from how long
-# the boss takes to come back. Anything at or under the short cutoff gets a
-# 1-minute heads-up; past that, WARN_TIERS applies.
-SHORT_RESPAWN_CUTOFF_MINUTES = 60
+# the boss takes to come back. 30 minutes or less -> 1m, 60 minutes or less ->
+# 3m; past that, WARN_TIERS applies.
+SHORT_RESPAWN_CUTOFF_MINUTES = 30
 SHORT_WARN_MINUTES = 1
-LONG_WARN_MINUTES = 7
+MEDIUM_RESPAWN_CUTOFF_MINUTES = 60
+MEDIUM_WARN_MINUTES = 3
+LONG_WARN_MINUTES = 10
 
 # (respawn of at least this many minutes) -> warn this many minutes ahead.
 # Checked longest-first, so it reads as: 6 days or more -> 60m, 2 up to 6 days
-# -> 30m, 1 up to 2 days -> 15m. Anything under a day (but over the short
-# cutoff) falls through to LONG_WARN_MINUTES. Bounds are inclusive at the low
+# -> 30m, 1 up to 2 days -> 15m. Anything under a day (but over an hour) falls
+# through to LONG_WARN_MINUTES. Bounds are inclusive at the low
 # end, so a boss on exactly a 2-day timer gets the 30-minute warning.
 WARN_TIERS = (
     (6 * 24 * 60, 60),
@@ -45,12 +47,12 @@ WARN_TIERS = (
     (1 * 24 * 60, 15),
 )
 
-# Warn values the old two-step rule could produce. A boss still sitting on one
-# of these has never been customised, so the tiers above are applied to it once
-# (see WARN_RULE_VERSION); any other value came from `/editboss warn_minutes`
-# and is left alone.
+# Warn values earlier versions of the rule gave bosses under a day. A boss still
+# sitting on one of these has never been customised, so the current rule is
+# applied to it once per rule change (bump WARN_RULE_VERSION when the rule
+# changes); any other value came from `/editboss warn_minutes` and is kept.
 LEGACY_AUTO_WARN_MINUTES = (1, 5, 7)
-WARN_RULE_VERSION = 2
+WARN_RULE_VERSION = 3
 
 # Who gets pinged by a warning when the boss has no role configured.
 DEFAULT_PING = "@everyone"
@@ -92,9 +94,16 @@ MINI_BOSS_PRESETS = {
     "glucose":  30,
     "overload": 30,
     "apapa":    15,
-    "inspector": 60,
-    "morty":     59 + 45 / 60,
+    "inspector": 58 + 23 / 60,
+    "morty":     59 + 50 / 60,
     "snakezard": 8 * 60 + 43 + 20 / 60,
+    "tank":       58 + 20 / 60,
+    "maelstrom":  58 + 20 / 60,
+    "twister":    58 + 20 / 60,
+    "swirlflame": 58 + 20 / 60,
+    "elemental queen": 2 * 60 + 30,
+    "bssszsss":        30,
+    "shaaack":         30,
 }
 
 # Short names accepted anywhere a boss name is typed: `/d boss:lich` or a text
@@ -117,7 +126,26 @@ BOSS_ALIASES = {
     "awakenkooii": ("ak", "awaken"),
     "wadangka":    ("wdk",),
     "devilang":    ("devi",),
+    "maelstrom":   ("blue",),
+    "twister":     ("green",),
+    "swirlflame":  ("red",),
+    "elemental queen": ("eq", "queen"),
+    "bssszsss":    ("red bee", "rb"),
+    "shaaack":     ("shack",),
 }
+
+# Bosses that die together, reported with one name: `sky d 49:11` starts every
+# member's timer from the same death time, posts one combined death message,
+# and sends one warning/respawn ping for the lot instead of one per boss.
+# Each entry is (display name, names it answers to, member bosses). The display
+# name doubles as the group's ping role name in /reactroles.
+BOSS_GROUPS = (
+    ("Eastern Sky", ("eastern", "eastern sky", "east", "eastsky", "east sky", "sky"),
+     ("tank", "maelstrom", "twister", "swirlflame")),
+)
+
+# {member boss: (display name, all members)}
+BOSS_GROUP_OF = {m: (label, members) for label, _names, members in BOSS_GROUPS for m in members}
 
 # The two boards. Each lives in its own channel and shows only the timers for
 # bosses assigned to it; warnings and respawn pings go to that same channel.
@@ -202,6 +230,11 @@ def guild_state(guild_id: int) -> dict:
     for category in BOARDS:
         menus.setdefault(category, {"channel_id": None, "message_id": None, "map": {}})
 
+    # Per-server settings for each boss group: its shared ping role and emoji.
+    groups = state.setdefault("groups", {})
+    for label, _names, _members in BOSS_GROUPS:
+        groups.setdefault(label, {"role_id": None, "emoji": None})
+
     # Migrate the old single-board schema. The existing board becomes the main
     # one and keeps its message id, so it is edited in place rather than
     # reposted — otherwise the channel ends up with two lists.
@@ -244,6 +277,8 @@ def default_warn_minutes(respawn_minutes: float) -> int:
     """How far ahead of respawn to ping, derived from the respawn length."""
     if respawn_minutes <= SHORT_RESPAWN_CUTOFF_MINUTES:
         return SHORT_WARN_MINUTES
+    if respawn_minutes <= MEDIUM_RESPAWN_CUTOFF_MINUTES:
+        return MEDIUM_WARN_MINUTES
     for min_respawn_minutes, warn_minutes in WARN_TIERS:
         if respawn_minutes >= min_respawn_minutes:
             return warn_minutes
@@ -278,10 +313,27 @@ def boss_label(guild_id: int, boss_name: str) -> str:
     return f"{emoji} **{boss_name.title()}**" if emoji else f"**{boss_name.title()}**"
 
 
-def resolve_ping(guild: discord.Guild, boss_cfg: dict) -> str:
-    """Who to ping for this boss, resolved at send time so /editboss applies live."""
+def group_role(guild: discord.Guild, label: str):
+    cfg = guild_state(guild.id)["groups"].get(label, {})
+    return guild.get_role(cfg["role_id"]) if cfg.get("role_id") else None
+
+
+def resolve_ping(guild: discord.Guild, boss_cfg: dict, boss_name: str = None) -> str:
+    """Who to ping for this boss, resolved at send time so /editboss applies live.
+
+    The boss's own role wins; a boss in a group with no role of its own pings
+    the group's role (e.g. Eastern Sky); otherwise DEFAULT_PING.
+    """
     role = guild.get_role(boss_cfg["role_id"]) if boss_cfg.get("role_id") else None
+    if role is None and boss_name in BOSS_GROUP_OF:
+        role = group_role(guild, BOSS_GROUP_OF[boss_name][0])
     return role.mention if role else DEFAULT_PING
+
+
+def group_label(guild_id: int, label: str) -> str:
+    """Display name for a boss group — bold, prefixed with its emoji if set."""
+    emoji = guild_state(guild_id)["groups"].get(label, {}).get("emoji")
+    return f"{emoji} **{label}**" if emoji else f"**{label}**"
 
 
 # ── Board messages (one updating timer list per board) ───────────────────────
@@ -416,8 +468,66 @@ def resolve_died_at(
     return now
 
 
-async def start_timer(guild: discord.Guild, boss_name: str, respawns_at: datetime, reported_by: str, repost: bool = False) -> None:
+def leave_group(state: dict, boss_name: str) -> None:
+    """Take a boss out of its group report before its timer is cancelled or replaced.
+
+    Only the leader of a group report pings, naming the members stored on its
+    timer. So a member leaving is struck off the others' member lists, and a
+    leader leaving passes the lead on — otherwise cancelling or re-reporting
+    the leader alone would leave the rest of the group silent. Natural expiry
+    doesn't come through here: the whole group respawns together.
+    """
+    info = state["timers"].get(boss_name)
+    if not info or not info.get("group_id"):
+        return
+    siblings = [
+        other for other in info.get("group_members", ())
+        if other != boss_name and state["timers"].get(other, {}).get("group_id") == info["group_id"]
+    ]
+    for other in siblings:
+        other_info = state["timers"][other]
+        other_info["group_members"] = [m for m in other_info["group_members"] if m != boss_name]
+    if info.get("group_leader") and siblings:
+        state["timers"][siblings[0]]["group_leader"] = True
+    info.pop("group_id", None)
+    info["group_leader"] = False
+
+
+def alert_subject(guild: discord.Guild, boss_name: str, boss_cfg: dict) -> tuple:
+    """(who, ping) for a warning/respawn message, or (None, None) to stay quiet.
+
+    A boss reported on its own announces itself. For a group report only the
+    leader speaks, naming every member and pinging the group's role once.
+    """
+    info = guild_state(guild.id)["timers"].get(boss_name) or {}
+    if not info.get("group_id"):
+        return boss_label(guild.id, boss_name), resolve_ping(guild, boss_cfg, boss_name)
+    if not info.get("group_leader"):
+        return None, None
+
+    label = BOSS_GROUP_OF[boss_name][0]
+    members = info.get("group_members") or [boss_name]
+    if len(members) == 1:
+        # Everyone else left the group; this is just a single boss again.
+        return boss_label(guild.id, boss_name), resolve_ping(guild, boss_cfg, boss_name)
+    names = ", ".join(boss_label(guild.id, m) for m in members)
+    role = group_role(guild, label)
+    return f"{group_label(guild.id, label)} ({names})", (role.mention if role else DEFAULT_PING)
+
+
+async def start_timer(
+    guild: discord.Guild,
+    boss_name: str,
+    respawns_at: datetime,
+    reported_by: str,
+    repost: bool = False,
+    group_id: str = None,
+    group_leader: bool = False,
+    group_members: list = None,
+) -> None:
     state = guild_state(guild.id)
+    # A boss re-reported leaves whatever group report it was part of.
+    leave_group(state, boss_name)
 
     # Cancel any existing run for this boss, and wait for it to finish unwinding
     # before touching state. cancel() only schedules the cancellation, so the old
@@ -437,6 +547,10 @@ async def start_timer(guild: discord.Guild, boss_name: str, respawns_at: datetim
         "respawns_at": respawns_at.isoformat(),
         "reported_by": reported_by,
     }
+    if group_id:
+        state["timers"][boss_name].update(
+            group_id=group_id, group_leader=group_leader, group_members=list(group_members),
+        )
     save_data(store)
     await refresh_boss_board(guild, boss_name, repost=repost)
 
@@ -462,13 +576,13 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
         warn_sleep = (warn_at - now).total_seconds()
         if warn_sleep > 0:
             await asyncio.sleep(warn_sleep)
+            who, ping = alert_subject(guild, boss_name, boss_cfg)
             # Resolved here rather than at task start, so a boss moved between
             # boards mid-countdown alerts in its new channel.
             channel = await get_board_channel(guild, boss_category(guild.id, boss_name))
-            if channel:
+            if channel and who:
                 warn_msg = await channel.send(
-                    f"{resolve_ping(guild, boss_cfg)} {boss_label(guild.id, boss_name)} "
-                    f"respawns in **{boss_cfg['warn_minutes']}m** — <t:{unix_ts}:T>"
+                    f"{ping} {who} respawns in **{boss_cfg['warn_minutes']}m** — <t:{unix_ts}:T>"
                 )
 
         now = datetime.now(timezone.utc)
@@ -476,10 +590,10 @@ async def _run_timer(guild: discord.Guild, boss_name: str) -> None:
         if final_sleep > 0:
             await asyncio.sleep(final_sleep)
 
-        respawned_text = (
-            f"{resolve_ping(guild, boss_cfg)} {boss_label(guild.id, boss_name)} "
-            f"has respawned at <t:{unix_ts}:T> (<t:{unix_ts}:R>)"
-        )
+        who, ping = alert_subject(guild, boss_name, boss_cfg)
+        if not who:
+            return  # a group follower: the group's leader announces for everyone
+        respawned_text = f"{ping} {who} has respawned at <t:{unix_ts}:T> (<t:{unix_ts}:R>)"
         if warn_msg is not None:
             try:
                 await warn_msg.edit(content=respawned_text)
@@ -513,6 +627,17 @@ async def boss_autocomplete(interaction: discord.Interaction, current: str):
         if typed in normalise_boss_key(name)
         or any(alias.startswith(typed) for alias in BOSS_ALIASES.get(name, ()))
     ][:25]
+
+
+async def death_autocomplete(interaction: discord.Interaction, current: str):
+    """/d suggestions: boss groups first, then individual bosses."""
+    typed = normalise_boss_key(current)
+    groups = [
+        app_commands.Choice(name=f"{label} (all {len(members)})", value=names[0])
+        for label, names, members in BOSS_GROUPS
+        if any(normalise_boss_key(n).startswith(typed) for n in names)
+    ]
+    return (groups + await boss_autocomplete(interaction, current))[:25]
 
 
 async def active_timer_autocomplete(interaction: discord.Interaction, current: str):
@@ -581,7 +706,10 @@ def emoji_sync_embed(guild_id: int, result: dict, seeded: list = None) -> discor
         if names:
             embed.add_field(
                 name=f"{title} ({len(names)})",
-                value=clip_names(", ".join(boss_label(guild_id, n) for n in names), len(names)),
+                value=clip_names(", ".join(
+                    group_label(guild_id, n) if n in guild_state(guild_id)["groups"]
+                    else boss_label(guild_id, n)
+                    for n in names), len(names)),
                 inline=False,
             )
 
@@ -625,51 +753,59 @@ async def sync_boss_emojis(guild: discord.Guild, boss_names, overwrite: bool = F
     result = {"created": [], "reused": [], "kept": [], "missing": [], "failed": [],
               "files": len(files)}
 
-    for boss_name in boss_names:
-        cfg = state["bosses"].get(boss_name)
-        if cfg is None:
-            continue
+    # (name, its config, image path or None, report a missing image?)
+    targets = [
+        (name, state["bosses"][name], files.get(normalise_boss_key(name)), True)
+        for name in boss_names if name in state["bosses"]
+    ]
+    # Groups use an image named after the group (`eastern sky.png`) or any of the
+    # names it answers to. No image is fine: /reactroles falls back to a member's.
+    for label, names, _members in BOSS_GROUPS:
+        keys = [normalise_boss_key(label)] + [normalise_boss_key(n) for n in names]
+        path = next((files[k] for k in keys if k in files), None)
+        targets.append((label, state["groups"][label], path, False))
 
-        path = files.get(normalise_boss_key(boss_name))
+    for name, cfg, path, report_missing in targets:
         if path is None:
-            result["missing"].append(boss_name)
+            if report_missing:
+                result["missing"].append(name)
             continue
         if cfg.get("emoji") and not overwrite:
-            result["kept"].append(boss_name)
+            result["kept"].append(name)
             continue
 
-        emoji_name = emoji_name_for(boss_name)
+        emoji_name = emoji_name_for(name)
         existing = discord.utils.get(guild.emojis, name=emoji_name)
         if existing is not None:
             cfg["emoji"] = str(existing)
-            result["reused"].append(boss_name)
+            result["reused"].append(name)
             continue
 
         try:
             size = os.path.getsize(path)
             if size > EMOJI_MAX_BYTES:
                 result["failed"].append(
-                    (boss_name, f"{size // 1024} KB — over Discord's 256 KB limit")
+                    (name, f"{size // 1024} KB — over Discord's 256 KB limit")
                 )
                 continue
             with open(path, "rb") as fh:
                 image = fh.read()
             created = await guild.create_custom_emoji(
-                name=emoji_name, image=image, reason=f"Boss timer emoji for {boss_name}"
+                name=emoji_name, image=image, reason=f"Boss timer emoji for {name}"
             )
         except discord.Forbidden:
             # Every remaining upload would fail identically, so stop here rather
             # than filling the report with the same line 19 times.
             result["failed"].append(
-                (boss_name, "the bot is missing the **Manage Expressions** permission")
+                (name, "the bot is missing the **Manage Expressions** permission")
             )
             break
         except (discord.HTTPException, OSError) as exc:
-            result["failed"].append((boss_name, str(exc)))
+            result["failed"].append((name, str(exc)))
             continue
 
         cfg["emoji"] = str(created)
-        result["created"].append(boss_name)
+        result["created"].append(name)
 
     save_data(store)
     return result
@@ -711,10 +847,7 @@ async def ensure_ping_role(guild: discord.Guild, boss_name: str, cfg: dict,
 
 
 def build_reaction_role_embed(guild_id: int, category: str, entries: list) -> discord.Embed:
-    lines = [
-        f"{boss_label(guild_id, name)} — {role.mention}"
-        for name, _emoji, role in entries
-    ]
+    lines = [f"{display} — {role.mention}" for _key, display, _emoji, role in entries]
     return discord.Embed(
         title=f"{BOARD_TITLES[category]} — ping roles",
         description=(
@@ -776,10 +909,14 @@ async def handle_reaction_role(payload, adding: bool) -> None:
     if menu is None:
         return
 
-    boss_name = menu["map"].get(str(payload.emoji))
-    if boss_name is None:
+    key = menu["map"].get(str(payload.emoji))
+    if key is None:
         return
-    cfg = state["bosses"].get(boss_name)
+    # `group:<name>` entries hand out the group's shared role.
+    if key.startswith("group:"):
+        cfg = state["groups"].get(key.removeprefix("group:"))
+    else:
+        cfg = state["bosses"].get(key)
     if not cfg or not cfg.get("role_id"):
         return
 
@@ -1084,7 +1221,7 @@ async def bosses_cmd(interaction: discord.Interaction):
         lines.extend(
             f"• {boss_label(interaction.guild_id, name)} — "
             f"{format_duration(cfg['respawn_minutes'])} respawn, "
-            f"{cfg['warn_minutes']}m warning, pings {resolve_ping(interaction.guild, cfg)}"
+            f"{cfg['warn_minutes']}m warning, pings {resolve_ping(interaction.guild, cfg, name)}"
             for name, cfg in sorted(entries, key=lambda kv: (kv[1]["respawn_minutes"], kv[0]))
         )
 
@@ -1133,6 +1270,20 @@ for _boss, _aliases in BOSS_ALIASES.items():
             raise ValueError(f"Short name {_alias!r} is used by both {_boss} and {BOSS_ALIAS_LOOKUP[_key]}")
         BOSS_ALIAS_LOOKUP[_key] = _boss
 
+# {normalised group name: (display name, member bosses)}. A group name that
+# clashes with a boss's short name or preset name would make one of them
+# unreachable, so that fails at startup too.
+BOSS_GROUP_LOOKUP = {}
+_ALL_PRESET_KEYS = {normalise_boss_key(n) for d in (BOSS_PRESETS, MINI_BOSS_PRESETS) for n in d}
+for _label, _names, _members in BOSS_GROUPS:
+    for _name in _names:
+        _key = normalise_boss_key(_name)
+        if _key in BOSS_ALIAS_LOOKUP or _key in _ALL_PRESET_KEYS:
+            raise ValueError(f"Group name {_name!r} clashes with a boss name or short name")
+        if BOSS_GROUP_LOOKUP.get(_key, (_label,))[0] != _label:
+            raise ValueError(f"Group name {_name!r} is used by two groups")
+        BOSS_GROUP_LOOKUP[_key] = (_label, _members)
+
 
 def lookup_boss(guild_id: int, text: str) -> str:
     """Resolve typed text to a registered boss: full name, short name, or unique prefix."""
@@ -1173,6 +1324,7 @@ def plan_death(
     time: str = None,
     utc_offset: float = 0.0,
     second: int = None,
+    now: datetime = None,
 ) -> DeathPlan:
     """Validate a death report without touching Discord. Raises DeathReportError."""
     boss = lookup_boss(guild_id, boss)
@@ -1193,7 +1345,7 @@ def plan_death(
     if second is not None and not (0 <= second <= 59):
         raise DeathReportError("Second must be between 0 and 59.")
 
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     died_at_dt = None
 
     if time is not None:
@@ -1223,18 +1375,82 @@ def plan_death(
     return DeathPlan(boss, category, died_at, respawns_at)
 
 
-async def commit_death(guild: discord.Guild, plan: DeathPlan, reporter: discord.abc.User) -> None:
-    """Announce a validated death and start its timer."""
-    died_ts = int(plan.died_at.timestamp())
-    channel = await get_board_channel(guild, plan.category)
-    if channel:
+class DeathReport(NamedTuple):
+    plans: list          # one DeathPlan per boss
+    group: str | None    # group display name, when a group name was typed
+
+
+def plan_deaths(
+    guild_id: int,
+    text: str,
+    minute: int = None,
+    time: str = None,
+    utc_offset: float = 0.0,
+    second: int = None,
+) -> DeathReport:
+    """Validate a report for one boss or a whole group. Raises DeathReportError.
+
+    A group is all-or-nothing: if any member can't be planned, no timer starts,
+    so the board never ends up with half a group running.
+    """
+    group = BOSS_GROUP_LOOKUP.get(normalise_boss_key(text))
+    if group is None:
+        return DeathReport([plan_death(guild_id, text, minute, time, utc_offset, second)], None)
+
+    label, members = group
+    bosses = guild_state(guild_id)["bosses"]
+    missing = [m for m in members if m not in bosses]
+    if missing:
+        raise DeathReportError(
+            f"**{label}** includes bosses that aren't registered yet: "
+            f"{', '.join(m.title() for m in missing)}. Ask an admin to run `/seedpresets`."
+        )
+    # One shared clock, so every member gets the identical death time even when
+    # the report is "just now".
+    now = datetime.now(timezone.utc)
+    plans = [plan_death(guild_id, m, minute, time, utc_offset, second, now=now) for m in members]
+    return DeathReport(plans, label)
+
+
+async def commit_deaths(guild: discord.Guild, report: DeathReport, reporter: discord.abc.User) -> None:
+    """Announce validated deaths and start their timers."""
+    by_board = {}
+    for plan in report.plans:
+        by_board.setdefault(plan.category, []).append(plan)
+
+    for category, plans in by_board.items():
+        channel = await get_board_channel(guild, category)
+        if not channel:
+            continue
+        died_ts = int(plans[0].died_at.timestamp())
+        names = ", ".join(boss_label(guild.id, p.boss) for p in plans)
+        who = f"**{report.group}** ({names})" if report.group else names
         await channel.send(
-            f"\U0001f480 {boss_label(guild.id, plan.boss)} reported dead at <t:{died_ts}:T> "
+            f"\U0001f480 {who} reported dead at <t:{died_ts}:T> "
             f"(<t:{died_ts}:R>) by {reporter.mention}."
         )
 
-    # Repost last so the refreshed timer list is the newest message in the channel.
-    await start_timer(guild, plan.boss, plan.respawns_at, reported_by=str(reporter), repost=True)
+    # A group report shares one id; its first member is the leader that sends
+    # the single warning/respawn ping for all of them.
+    members = [p.boss for p in report.plans]
+    group_id = f"{report.group}@{report.plans[0].died_at.isoformat()}" if report.group else None
+    for i, plan in enumerate(report.plans):
+        await start_timer(
+            guild, plan.boss, plan.respawns_at, reported_by=str(reporter),
+            group_id=group_id, group_leader=(i == 0), group_members=members,
+        )
+
+    # Repost last, once per board, so the refreshed timer list is the newest
+    # message in the channel.
+    for category in by_board:
+        await refresh_board(guild, category, repost=True)
+
+
+def started_text(report: DeathReport) -> str:
+    names = ", ".join(p.boss.title() for p in report.plans)
+    if report.group:
+        return f"✅ Timers started for **{report.group}**: {names}."
+    return f"✅ Timer started for **{names}**."
 
 
 async def report_death(
@@ -1246,21 +1462,19 @@ async def report_death(
     second: int = None,
 ):
     try:
-        plan = plan_death(interaction.guild_id, boss, minute, time, utc_offset, second)
+        report = plan_deaths(interaction.guild_id, boss, minute, time, utc_offset, second)
     except DeathReportError as exc:
         await interaction.response.send_message(str(exc), ephemeral=True)
         return
 
     # Acknowledge before the board repost, which can outrun the 3-second deadline.
-    await interaction.response.send_message(
-        f"✅ Timer started for **{plan.boss.title()}**.", ephemeral=True
-    )
-    await commit_death(interaction.guild, plan, interaction.user)
+    await interaction.response.send_message(started_text(report), ephemeral=True)
+    await commit_deaths(interaction.guild, report, interaction.user)
 
 
 @bot.tree.command(name="d", description="Report a boss death and start its respawn timer.")
 @app_commands.describe(**DIED_DESCRIPTIONS)
-@app_commands.autocomplete(boss=boss_autocomplete)
+@app_commands.autocomplete(boss=death_autocomplete)
 async def died_short(
     interaction: discord.Interaction,
     boss: str,
@@ -1286,6 +1500,8 @@ async def cancel(interaction: discord.Interaction, boss: str):
 
     if boss in task_map:
         task_map[boss].cancel()
+    # If it was pinging for a group, the rest of the group still needs a voice.
+    leave_group(state, boss)
     state["timers"].pop(boss, None)
     save_data(store)
     await refresh_boss_board(interaction.guild, boss)
@@ -1319,6 +1535,9 @@ async def cancelall(interaction: discord.Interaction, board: Literal["main", "mi
     # cannot fail, so the reply can never claim a cancellation that did not
     # happen, and the ack still lands well inside the 3-second deadline.
     for name in cancelled:
+        # A group can span both boards if a member was moved, so a board-only
+        # cancel may leave part of a group behind that still needs its leader.
+        leave_group(state, name)
         state["timers"].pop(name, None)
     save_data(store)
 
@@ -1401,12 +1620,34 @@ async def reactroles(
     state = guild_state(interaction.guild_id)
     guild = interaction.guild
 
-    entries, no_emoji, no_role, made_roles = [], [], [], []
-    for name in sorted(n for n in state["bosses"] if boss_category(guild.id, n) == board):
+    # Bosses in a group are offered as one entry for the whole group, with one
+    # shared role (e.g. "Eastern Sky"), instead of one role per member.
+    # Each candidate is (menu key, name for the report, display text, config, emoji).
+    on_board = sorted(n for n in state["bosses"] if boss_category(guild.id, n) == board)
+    candidates, groups_here = [], []
+    for name in on_board:
+        if name in BOSS_GROUP_OF:
+            label = BOSS_GROUP_OF[name][0]
+            if label not in groups_here:
+                groups_here.append(label)
+            continue
         cfg = state["bosses"][name]
-        # A menu entry is a reaction, so a boss with no emoji has nothing to
+        candidates.append((name, name, boss_label(guild.id, name), cfg, cfg.get("emoji")))
+    for label in groups_here:
+        cfg = state["groups"][label]
+        members = next(m for group, _names, m in BOSS_GROUPS if group == label)
+        # No group image uploaded yet: borrow the first member emoji available.
+        emoji = cfg.get("emoji") or next(
+            (state["bosses"][m].get("emoji") for m in members
+             if m in state["bosses"] and state["bosses"][m].get("emoji")), None)
+        display = f"{emoji} **{label}**" if emoji else f"**{label}**"
+        candidates.append((f"group:{label}", label, display, cfg, emoji))
+
+    entries, no_emoji, no_role, made_roles = [], [], [], []
+    for key, name, display, cfg, emoji in candidates:
+        # A menu entry is a reaction, so something with no emoji has nothing to
         # react with — skip it and say so rather than posting a blank row.
-        if not cfg.get("emoji"):
+        if not emoji:
             no_emoji.append(name)
             continue
         try:
@@ -1422,7 +1663,7 @@ async def reactroles(
             continue
         if note == "created":
             made_roles.append(name)
-        entries.append((name, cfg["emoji"], role))
+        entries.append((key, display, emoji, role))
 
     save_data(store)
 
@@ -1450,14 +1691,14 @@ async def reactroles(
     )
 
     emoji_map = {}
-    for name, emoji, _role in entries:
+    for key, _display, emoji, _role in entries:
         partial = discord.PartialEmoji.from_str(emoji)
         try:
             await message.add_reaction(partial)
         except (discord.Forbidden, discord.HTTPException):
-            no_role.append((name, "the bot could not add its reaction"))
+            no_role.append((key.removeprefix("group:"), "the bot could not add its reaction"))
             continue
-        emoji_map[str(partial)] = name
+        emoji_map[str(partial)] = key
 
     state["reaction_roles"][board] = {
         "channel_id": interaction.channel.id,
@@ -1536,6 +1777,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`faith d` — it just died\n"
             "`lich d :55`, `lich d 55` or `lich d55` — died at :55\n"
             "`ak d 12:10`, `:12:10` or `12.10` — died at 12m 10s past the hour\n"
+            "`sky d 49:11` — all of Eastern Sky (Tank, Maelstrom, Twister, Swirlflame) at once\n"
             "Short names work (`lich`, `ak`, `whale`…), as does any unambiguous "
             "start of a name. ✅ means the timer started."
         ),
@@ -1623,7 +1865,7 @@ async def text_death_report(message: discord.Message):
     minute, second = parse_report_time(match["when"])
 
     try:
-        plan = plan_death(message.guild.id, match["name"], minute, second=second)
+        report = plan_deaths(message.guild.id, match["name"], minute, second=second)
     except DeathReportError as exc:
         # Short-lived reply so mistakes don't clutter the board channel.
         await add_reaction_quietly(message, "❌")
@@ -1631,7 +1873,7 @@ async def text_death_report(message: discord.Message):
         return
 
     await add_reaction_quietly(message, "✅")
-    await commit_death(message.guild, plan, message.author)
+    await commit_deaths(message.guild, report, message.author)
 
 
 async def add_reaction_quietly(message: discord.Message, emoji: str) -> None:
@@ -1670,12 +1912,15 @@ async def on_ready():
                 state["timers"].pop(boss_name, None)
                 continue
             if respawns_at <= now:
+                # Worked out before the entry is removed: a group report gets one
+                # notice from its leader, naming every member.
+                who, _ping = alert_subject(guild, boss_name, state["bosses"][boss_name])
                 state["timers"].pop(boss_name, None)
                 channel = await get_board_channel(guild, boss_category(guild.id, boss_name))
-                if channel:
+                if channel and who:
                     unix_ts = int(respawns_at.timestamp())
                     await channel.send(
-                        f"{boss_label(guild.id, boss_name)} respawned at <t:{unix_ts}:T> "
+                        f"{who} respawned at <t:{unix_ts}:T> "
                         f"(<t:{unix_ts}:R>) while the bot was offline."
                     )
             else:

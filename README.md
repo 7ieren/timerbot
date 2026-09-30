@@ -99,6 +99,45 @@ at the top of `main.py`:
 | Awakenkooii | ak, awaken |
 | Wadangka | wdk |
 | Devilang | devi |
+| Maelstrom | blue |
+| Twister | green |
+| Swirlflame | red |
+| Elemental Queen | eq, queen |
+| Bssszsss | red bee, rb |
+| Shaaack | shack |
+
+### Groups
+
+Some bosses die together. A group name reports every member at once, with the
+same death time:
+
+| Group | Names | Members |
+|---|---|---|
+| Eastern Sky | eastern, eastern sky, east, eastsky, east sky, sky | Tank, Maelstrom, Twister, Swirlflame |
+
+`sky d 49:11` starts all four timers from 49m 11s past the hour; `/d boss:sky`
+works too. If any member isn't registered yet, nothing starts and the bot says
+which one is missing (run `/seedpresets`).
+
+**One ping per group.** A group report posts one death message, one warning
+and one respawn notice for all four, pinging the group's role once, instead
+of four overlapping pings:
+
+> @Eastern Sky **Eastern Sky** (Tank, Maelstrom, Twister, Swirlflame) respawns in 3m
+
+- If one member is later re-reported on its own (different time), it leaves the
+  group and pings separately; the rest still ping together.
+- Cancelling one member doesn't silence the others.
+- A member reported on its own pings the group role too, unless you give that
+  boss its own role with `/editboss`.
+
+**Group role.** `/reactroles` offers one entry for the whole group, handing out
+a role named after it (`Eastern Sky`), instead of four boss roles. An existing
+role with that name is reused. For its emoji, add an image named after the group
+(`eastern sky.png`) to `emojis/` and run `/syncemojis`; until then the menu
+borrows one of the members' emojis.
+
+Groups are set in `BOSS_GROUPS` at the top of `main.py`.
 
 ## Boards
 
@@ -119,16 +158,22 @@ come back:
 
 | Respawn | Warning |
 |---|---|
-| ≤ 1 hour | 1 min |
-| 1 hour – 1 day | 7 min |
+| ≤ 30 minutes | 1 min |
+| 30 minutes – 1 hour | 3 min |
+| 1 hour – 1 day | 10 min |
 | 1 – 2 days | 15 min |
 | 2 – 6 days | 30 min |
 | 6 days or more | 60 min |
 
-Lower bounds are inclusive, so an exactly 2-day boss gets the 30-minute warning.
+A boss on exactly 30 minutes gets 1 min and exactly 1 hour gets 3 min; from a
+day up, lower bounds are inclusive, so an exactly 2-day boss gets 30 min.
 Override a boss with `warn_minutes` on `/addboss` or `/editboss`. Tune the rule
 at the top of `main.py` (`SHORT_RESPAWN_CUTOFF_MINUTES`, `SHORT_WARN_MINUTES`,
-`LONG_WARN_MINUTES`, `WARN_TIERS`).
+`MEDIUM_RESPAWN_CUTOFF_MINUTES`, `MEDIUM_WARN_MINUTES`, `LONG_WARN_MINUTES`,
+`WARN_TIERS`).
+
+When the rule changes, bosses still on a previous default warning time are
+updated once on the next start; warning times set by hand are kept.
 
 Warnings ping the boss's role if it has one, otherwise `@everyone`.
 
