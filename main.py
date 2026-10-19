@@ -1412,33 +1412,65 @@ def plan_deaths(
     return DeathReport(plans, label)
 
 
-async def commit_deaths(guild: discord.Guild, report: DeathReport, reporter: discord.abc.User) -> None:
-    """Announce validated deaths and start their timers."""
-    by_board = {}
-    for plan in report.plans:
-        by_board.setdefault(plan.category, []).append(plan)
+def chunk_lines(lines: list, limit: int = 1900) -> list:
+    """Join lines into messages that each fit under Discord's 2000-character cap."""
+    chunks, current = [], ""
+    for line in lines:
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = ""
+        current = f"{current}\n{line}" if current else line[:limit]
+    if current:
+        chunks.append(current)
+    return chunks
 
-    for category, plans in by_board.items():
+
+async def commit_deaths(guild: discord.Guild, reports: list, reporter: discord.abc.User) -> None:
+    """Announce validated deaths and start their timers.
+
+    Takes several reports so a multi-line text report posts one death message
+    and one board repost per board, rather than one of each per line.
+    """
+    # {board: [(who, died_at)]}, one entry per report on that board.
+    by_board = {}
+    for report in reports:
+        per_board = {}
+        for plan in report.plans:
+            per_board.setdefault(plan.category, []).append(plan)
+        for category, plans in per_board.items():
+            names = ", ".join(boss_label(guild.id, p.boss) for p in plans)
+            who = f"**{report.group}** ({names})" if report.group else names
+            by_board.setdefault(category, []).append((who, plans[0].died_at))
+
+    for category, entries in by_board.items():
         channel = await get_board_channel(guild, category)
         if not channel:
             continue
-        died_ts = int(plans[0].died_at.timestamp())
-        names = ", ".join(boss_label(guild.id, p.boss) for p in plans)
-        who = f"**{report.group}** ({names})" if report.group else names
-        await channel.send(
-            f"\U0001f480 {who} reported dead at <t:{died_ts}:T> "
-            f"(<t:{died_ts}:R>) by {reporter.mention}."
-        )
+        if len(entries) == 1:
+            who, died_at = entries[0]
+            died_ts = int(died_at.timestamp())
+            await channel.send(
+                f"\U0001f480 {who} reported dead at <t:{died_ts}:T> "
+                f"(<t:{died_ts}:R>) by {reporter.mention}."
+            )
+            continue
+        lines = [f"\U0001f480 Reported dead by {reporter.mention}:"] + [
+            f"• {who} — <t:{int(died_at.timestamp())}:T> (<t:{int(died_at.timestamp())}:R>)"
+            for who, died_at in entries
+        ]
+        for chunk in chunk_lines(lines):
+            await channel.send(chunk)
 
-    # A group report shares one id; its first member is the leader that sends
-    # the single warning/respawn ping for all of them.
-    members = [p.boss for p in report.plans]
-    group_id = f"{report.group}@{report.plans[0].died_at.isoformat()}" if report.group else None
-    for i, plan in enumerate(report.plans):
-        await start_timer(
-            guild, plan.boss, plan.respawns_at, reported_by=str(reporter),
-            group_id=group_id, group_leader=(i == 0), group_members=members,
-        )
+    for report in reports:
+        # A group report shares one id; its first member is the leader that
+        # sends the single warning/respawn ping for all of them.
+        members = [p.boss for p in report.plans]
+        group_id = f"{report.group}@{report.plans[0].died_at.isoformat()}" if report.group else None
+        for i, plan in enumerate(report.plans):
+            await start_timer(
+                guild, plan.boss, plan.respawns_at, reported_by=str(reporter),
+                group_id=group_id, group_leader=(i == 0), group_members=members,
+            )
 
     # Repost last, once per board, so the refreshed timer list is the newest
     # message in the channel.
@@ -1469,7 +1501,7 @@ async def report_death(
 
     # Acknowledge before the board repost, which can outrun the 3-second deadline.
     await interaction.response.send_message(started_text(report), ephemeral=True)
-    await commit_deaths(interaction.guild, report, interaction.user)
+    await commit_deaths(interaction.guild, [report], interaction.user)
 
 
 @bot.tree.command(name="d", description="Report a boss death and start its respawn timer.")
@@ -1778,6 +1810,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`lich d :55`, `lich d 55` or `lich d55` — died at :55\n"
             "`ak d 12:10`, `:12:10` or `12.10` — died at 12m 10s past the hour\n"
             "`sky d 49:11` — all of Eastern Sky (Tank, Maelstrom, Twister, Swirlflame) at once\n"
+            "Several bosses in one message: one report per line\n"
             "Short names work (`lich`, `ak`, `whale`…), as does any unambiguous "
             "start of a name. ✅ means the timer started."
         ),
@@ -1829,8 +1862,9 @@ async def before_board_refresher():
 # optional too (`apa d08`, `apa d12:10`):
 #   :55  or 55                                  minute 55
 #   :12:10  or 12:10  or :12.10  or 12.10       minute 12, second 10
-# There is no time-of-day form here; `/d time:` covers that. Anything that
-# doesn't fit this shape is ordinary chat and is ignored.
+# There is no time-of-day form here; `/d time:` covers that. A message may hold
+# several reports, one per line. A message with no line of this shape is
+# ordinary chat and is ignored.
 TEXT_DEATH_REPORT = re.compile(
     r"^\s*(?P<name>\S+(?:\s+\S+){0,2}?)\s+(?:d|died|dead)"
     r"(?:\s*(?P<when>:?\d{1,2}(?:[:.]\d{2})?))?\s*$",
@@ -1858,22 +1892,57 @@ async def text_death_report(message: discord.Message):
     boards = guild_state(message.guild.id)["boards"].values()
     if message.channel.id not in {b["channel_id"] for b in boards if b["channel_id"]}:
         return
-    match = TEXT_DEATH_REPORT.match(message.content)
-    if match is None:
+    lines = [line.strip() for line in message.content.splitlines() if line.strip()]
+    matches = [(line, TEXT_DEATH_REPORT.match(line)) for line in lines]
+    if not any(m for _line, m in matches):
         return
 
-    minute, second = parse_report_time(match["when"])
+    # Each line stands alone: the valid ones start, the rest are reported back,
+    # so a typo on one line only means resending that line.
+    reports, errors, seen = [], [], set()
+    for line, match in matches:
+        if match is None:
+            errors.append((line, "not a death report — expected e.g. `faith d :55`"))
+            continue
+        minute, second = parse_report_time(match["when"])
+        try:
+            report = plan_deaths(message.guild.id, match["name"], minute, second=second)
+        except DeathReportError as exc:
+            errors.append((line, str(exc)))
+            continue
+        # Two lines naming the same boss (`tank d 14` and `sky d 14`) would
+        # have the second silently replace the first, so refuse the repeat.
+        bosses = {p.boss for p in report.plans}
+        repeated = bosses & seen
+        if repeated:
+            errors.append((line, f"{', '.join(b.title() for b in sorted(repeated))} "
+                                 f"already reported in this message"))
+            continue
+        seen |= bosses
+        reports.append(report)
 
-    try:
-        report = plan_deaths(message.guild.id, match["name"], minute, second=second)
-    except DeathReportError as exc:
-        # Short-lived reply so mistakes don't clutter the board channel.
-        await add_reaction_quietly(message, "❌")
-        await message.reply(str(exc), mention_author=False, delete_after=15)
+    if errors:
+        if len(lines) == 1:
+            text = errors[0][1]
+        else:
+            text = "\n".join(
+                f"• `{line[:60].replace('`', chr(39))}` — {why}" for line, why in errors
+            )
+            if reports:
+                text = f"Started {len(reports)} of {len(lines)} lines. Not started:\n{text}"
+        # Short-lived reply so mistakes don't clutter the board channel. The
+        # reply echoes what was typed, so it must never ping anyone.
+        await add_reaction_quietly(message, "⚠️" if reports else "❌")
+        await message.reply(
+            chunk_lines(text.split("\n"))[0], mention_author=False, delete_after=15,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    if not reports:
         return
 
-    await add_reaction_quietly(message, "✅")
-    await commit_deaths(message.guild, report, message.author)
+    if not errors:
+        await add_reaction_quietly(message, "✅")
+    await commit_deaths(message.guild, reports, message.author)
 
 
 async def add_reaction_quietly(message: discord.Message, emoji: str) -> None:

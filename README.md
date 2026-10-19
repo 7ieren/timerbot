@@ -66,11 +66,26 @@ current hour — the leading colon and the space after `d` are both optional
 happened yet this hour is taken as last hour. To report an exact time of day,
 use `/d time:`.
 
-- The bot reacts ✅ when the timer starts. On a mistake it reacts ❌ and replies
-  with the reason; the reply deletes itself after 15 seconds.
+**Several at once.** Put one report per line in a single message:
+
+```
+Tank d :14
+Witch d 12
+Acta d 02:34
+```
+
+Each line is checked on its own. The bot posts one death message per board
+listing every boss, and reposts each board once.
+
+- The bot reacts ✅ when every timer starts. On a mistake it reacts ❌ and
+  replies with the reason; the reply deletes itself after 15 seconds.
+- In a multi-line message, if only some lines fail, the rest still start: the
+  bot reacts ⚠️ and replies listing the lines that didn't, so you only resend
+  those. A line that isn't a report counts as a failed line, and so does a boss
+  named twice in one message (e.g. `tank d 14` and `sky d 14`).
 - Either board channel works; the timer goes to the boss's own board.
-- `d`, `died` and `dead` are all accepted. Messages that don't fit the pattern
-  are treated as normal chat and ignored.
+- `d`, `died` and `dead` are all accepted. Messages with no line that fits the
+  pattern are treated as normal chat and ignored.
 - Requires the **Message Content Intent** to be enabled for the bot in the
   Discord Developer Portal (Bot → Privileged Gateway Intents).
 
