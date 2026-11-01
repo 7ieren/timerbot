@@ -93,7 +93,7 @@ MINI_BOSS_PRESETS = {
     "awakenkooii": 1 * 60 + 3,
     "glucose":  30,
     "overload": 30,
-    "apapa":    15,
+    "apapa":    15 + 3 / 60,
     "inspector": 58 + 23 / 60,
     "morty":     59 + 50 / 60,
     "snakezard": 8 * 60 + 43 + 20 / 60,
@@ -104,6 +104,8 @@ MINI_BOSS_PRESETS = {
     "elemental queen": 2 * 60 + 30,
     "bssszsss":        30,
     "shaaack":         30,
+    "steampunk": 2 * 60 + 30,
+    "bigfoot": 29 + 52 / 60
 }
 
 # Short names accepted anywhere a boss name is typed: `/d boss:lich` or a text
@@ -131,7 +133,9 @@ BOSS_ALIASES = {
     "swirlflame":  ("red",),
     "elemental queen": ("eq", "queen"),
     "bssszsss":    ("red bee", "rb"),
-    "shaaack":     ("shack",),
+    "shaaack":     ("shack", "shaack"),
+    "bigfoot":     ("bf",),
+    "steampunk":   ("sp",)
 }
 
 # Bosses that die together, reported with one name: `sky d 49:11` starts every
